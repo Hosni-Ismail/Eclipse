@@ -1,5 +1,27 @@
 # Historique
 
+## 1.1.0 — 18 novembre 2026
+
+- **Lumière bleue** : un filtre qui réchauffe l'image, réglé dans le panneau. Trois choix : *Non*, *Sous le min* (le
+  filtre vient avec l'assombrissement et atteint sa pleine chaleur à −30 %) et *Toujours*, avec un curseur de
+  chaleur. Ctrl+Alt+Maj+B passe à *Toujours*, puis revient au choix habituel, avec un rappel en bas de l'écran. Le
+  filtre passe par le même effet de couleur de Windows que l'assombrissement : il disparaît de lui-même si Eclipse
+  s'arrête.
+- **Consoles au clavier** : un questionnaire lit les prises que chaque écran annonce (DDC/CI) et celle qui montre le
+  PC. Chaque prise nommée reçoit un raccourci, Ctrl+Alt+Maj et une lettre, qui passe l'écran sur la console ; le même
+  raccourci le ramène sur le PC. Le menu de l'icône et le panneau le font aussi.
+- Un clic sur le raccourci d'une console, dans le questionnaire, en choisit un autre ; il reste si la console est
+  renommée. Une combinaison qui sert déjà dans Eclipse ou à une autre console est refusée, comme celles qui
+  empêcheraient d'écrire avec AltGr (Ctrl+Alt+E, qui écrit « € »).
+- Pendant qu'on fait une combinaison, pour une console ou pour le raccourci principal, les raccourcis d'Eclipse sont
+  suspendus : la combinaison est saisie au lieu de déclencher son action. Les chiffres et les touches s'affichent en
+  clair, en français (« Ctrl+Alt+1 », « Pg suiv », et non plus « D1 », « Next »).
+- Pendant le jeu sur l'écran principal de Windows, son voisin le devient, puis tout revient. Un écran revenu seul sur
+  le PC est vu en quelques secondes. À la fermeture, l'écran revient sur le PC ; après un arrêt brutal, Eclipse
+  reprend au démarrage suivant.
+- **Le panneau** prend le style de Windows 11 : une carte par sujet, un interrupteur pour « Lier les écrans » et un
+  bouton arrondi pour éteindre.
+
 ## 1.0.0 — 15 novembre 2026
 
 Première version publique, sous le nom **Eclipse**.

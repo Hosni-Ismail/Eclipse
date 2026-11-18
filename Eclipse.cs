@@ -1,17 +1,20 @@
 // Eclipse — éteint les écrans sans mettre le PC en veille, bloque le clavier et la souris, coupe le son,
-// et règle la luminosité des écrans, jusque sous leur minimum.
+// règle la luminosité des écrans, jusque sous leur minimum, filtre la lumière bleue et passe un écran sur une console.
 //
 //   Ctrl+Alt+Maj+E            éteint, puis rallume (le raccourci se change depuis le menu de l'icône)
 //   Ctrl+Alt+Maj+Échap        sortie de secours : tout revient, tout de suite
-//   Clic sur l'icône          le panneau de luminosité (un curseur par écran)
+//   Clic sur l'icône          le panneau : la luminosité (un curseur par écran), la lumière bleue et les consoles
 //   Double-clic sur l'icône   éteint
 //   Ctrl+Alt+Maj+Haut / Bas   luminosité +10 % / -10 % sur tous les écrans
+//   Ctrl+Alt+Maj+B            filtre la lumière bleue, ou plus (la chaleur se règle dans le panneau)
+//   Ctrl+Alt+Maj+une lettre   passe un écran sur une console, puis le ramène sur le PC (menu de l'icône, Consoles)
 //
 // Un seul fichier, compilé par le compilateur du .NET Framework 4, déjà présent dans Windows : voir Compiler.bat.
 // Eclipse n'écrit qu'à trois endroits : %LOCALAPPDATA%\Eclipse (journal, sorties rendues muettes), la clé
-// HKCU\Software\Eclipse (raccourci, « Lier les écrans ») et, si vous le cochez, le lancement au démarrage
-// (HKCU\...\Run). Rien n'est envoyé sur Internet ; le seul échange réseau est local, avec SteelSeries Sonar s'il
-// est installé.
+// HKCU\Software\Eclipse (raccourci, « Lier les écrans », lumière bleue, consoles) et, si vous le cochez, le
+// lancement au démarrage (HKCU\...\Run). Pendant le jeu sur une console, il change aussi l'écran principal de
+// Windows, remis au retour. Rien n'est envoyé sur Internet ; le seul échange réseau est local, avec SteelSeries
+// Sonar s'il est installé.
 //
 // Comment c'est construit (le détail est dans les commentaires de chaque classe) :
 // - chaque tâche qui peut traîner a son propre fil : la fenêtre noire (Overlay), le blocage du clavier et de la
@@ -22,7 +25,10 @@
 //   brutal ; aucun volume n'est changé (Sound). Avec SteelSeries Sonar, ses sorties sont notées avant d'éteindre et
 //   remises au rallumage (Sonar) ;
 // - la luminosité : DDC/CI, la norme par laquelle le PC parle aux réglages de l'écran (Brightness, BrightnessPanel,
-//   Slider, LightOsd) ; sous le minimum, l'image elle-même est assombrie par l'effet de couleur de Windows (Dimmer) ;
+//   Slider, LightOsd) ; sous le minimum, l'image elle-même est assombrie par l'effet de couleur de Windows, le même
+//   qui filtre la lumière bleue (Dimmer) ;
+// - les consoles : la même norme passe un écran sur une autre prise (Inputs, ConsoleInput, ConsoleDialog) ; pendant le
+//   jeu sur l'écran principal, son voisin le devient (PrimaryScreen), puis tout revient ;
 // - pas de fenêtre d'erreur cachée sous l'écran noir : tout va dans %LOCALAPPDATA%\Eclipse\journal.txt (Journal).
 //
 // Historique : CHANGELOG.md. Licence : MIT (LICENSE).
@@ -59,6 +65,7 @@ namespace Eclipse
         public const int WM_APP_RELEASE = 0x8001;       // au fil principal : finir le rallumage
         public const int WM_APP_BEGIN_RELEASE = 0x8002; // au fil du blocage : rendre le clavier et la souris
         public const int WM_APP_LIGHT = 0x8003;         // au fil principal : afficher la luminosité réglée au clavier
+        public const int WM_APP_RUN = 0x8004;           // au fil principal : un travail rendu par le fil des écrans (consoles)
         public const uint VK_UP = 0x26, VK_DOWN = 0x28;
         public const int WM_QUIT = 0x0012;
         public const int WM_TIMER = 0x0113;
@@ -90,6 +97,10 @@ namespace Eclipse
         [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hwnd, int id, uint mods, uint vk);
         [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hwnd, int id);
+        [DllImport("user32.dll")] public static extern IntPtr GetKeyboardLayout(uint threadId);
+        [DllImport("user32.dll")] public static extern uint MapVirtualKeyEx(uint code, uint type, IntPtr layout);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int ToUnicodeEx(uint vk, uint scan, byte[] state, [Out] char[] text, int size, uint flags, IntPtr layout);
         [DllImport("user32.dll")] public static extern IntPtr RegisterPowerSettingNotification(IntPtr hwnd, ref Guid setting, int flags);
         [DllImport("user32.dll")] public static extern bool UnregisterPowerSettingNotification(IntPtr handle);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -1128,23 +1139,91 @@ namespace Eclipse
         [DllImport("dxva2.dll")] public static extern bool DestroyPhysicalMonitor(IntPtr handle);
         [DllImport("dxva2.dll", SetLastError = true)] public static extern bool GetVCPFeatureAndVCPFeatureReply(IntPtr handle, byte code, IntPtr type, out uint current, out uint max);
         [DllImport("dxva2.dll", SetLastError = true)] public static extern bool SetVCPFeature(IntPtr handle, byte code, uint value);
+        [DllImport("dxva2.dll", SetLastError = true)] public static extern bool GetCapabilitiesStringLength(IntPtr handle, out uint length);
+        [DllImport("dxva2.dll", SetLastError = true, CharSet = CharSet.Ansi)] public static extern bool CapabilitiesRequestAndCapabilitiesReply(IntPtr handle, StringBuilder caps, uint length);
         [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+
+        // \\.\DISPLAY1 -> l'identifiant de l'écran branché (DISPLAY\ABC1234\5&...&UID1), stable d'un démarrage à
+        // l'autre ; text : le nom que Windows lui donne. Vide si Windows ne le dit pas.
+        public static string MonitorId(string device, out string text)
+        {
+            text = null;
+            var dd = new DISPLAY_DEVICE { Size = Marshal.SizeOf(typeof(DISPLAY_DEVICE)) };
+            if (!EnumDisplayDevices(device, 0, ref dd, 1)) return string.Empty; // EDD_GET_DEVICE_INTERFACE_NAME
+            text = dd.Text;
+            string id = dd.Id ?? string.Empty;                                   // \\?\DISPLAY#ABC1234#5&...&UID1#{e6f07b5f-...}
+            if (id.StartsWith(@"\\?\")) id = id.Substring(4);
+            int guid = id.IndexOf("#{", StringComparison.Ordinal);
+            if (guid > 0) id = id.Substring(0, guid);
+            return id.Replace('#', '\\');
+        }
+
+        public static string MonitorId(string device)
+        {
+            string text;
+            return MonitorId(device, out text);
+        }
+
+        // Les écrans tels que Windows les place à l'instant : Screen.AllScreens garde ceux d'avant un changement tant que
+        // le fil principal n'a pas traité ses messages. Device : \\.\DISPLAY1 ; Flags & 1 : l'écran principal.
+        public static List<MONITORINFOEX> Monitors()
+        {
+            var list = new List<MONITORINFOEX>();
+            MonitorEnumProc proc = delegate(IntPtr monitor, IntPtr hdc, IntPtr rect, IntPtr data)
+            {
+                var info = new MONITORINFOEX { Size = Marshal.SizeOf(typeof(MONITORINFOEX)) };
+                if (GetMonitorInfo(monitor, ref info)) list.Add(info);
+                return true;
+            };
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, proc, IntPtr.Zero);
+            GC.KeepAlive(proc);
+            return list;
+        }
+
+        // DISPLAY\ABC1234\5&...&UID1 -> ABC1234 : le fabricant et le modèle, sans le branchement.
+        static string Model(string id)
+        {
+            string[] parts = (id ?? string.Empty).Split('\\');
+            return parts.Length > 1 ? parts[1] : string.Empty;
+        }
+
+        // L'écran qui porte cet identifiant ; sinon le seul écran du même modèle (l'identifiant change si le pilote de la
+        // carte graphique est réinstallé). -1 si aucun, ou si deux écrans du même modèle laissent un doute.
+        public static int FindScreen(IList<string> ids, string id)
+        {
+            if (string.IsNullOrEmpty(id)) return -1;
+            for (int i = 0; i < ids.Count; i++) if (string.Equals(ids[i], id, StringComparison.OrdinalIgnoreCase)) return i;
+            string model = Model(id);
+            int found = -1;
+            if (model.Length == 0) return -1;
+            for (int i = 0; i < ids.Count; i++)
+            {
+                if (!string.Equals(Model(ids[i]), model, StringComparison.OrdinalIgnoreCase)) continue;
+                if (found >= 0) return -1;
+                found = i;
+            }
+            return found;
+        }
     }
 
     // Un écran, tel que le fil de la luminosité le voit. Les copies données aux autres fils ne contiennent pas le handle.
     class ScreenLight
     {
         public string Device = string.Empty; // \\.\DISPLAY1 : le lien avec Screen.AllScreens
-        public string Name = string.Empty;   // le nom donné par l'écran (« VG27A », par exemple), lu dans Windows
+        public string Id = string.Empty;     // DISPLAY\ABC1234\5&...&UID1 : le même d'un démarrage à l'autre
+        public string Name = string.Empty;   // le nom donné par l'écran (souvent son modèle), lu dans Windows
         public Rectangle Bounds;
         public bool Ok;                      // l'écran répond en DDC/CI
         public int Percent;                  // 0 à 100
         public uint Max = 100;
+        public int[] Inputs;                 // ses entrées (code 0x60), lues seulement pour le questionnaire des consoles
+        public int Input = -1;               // l'entrée affichée, lue avec Inputs ; -1 : inconnue
         public IntPtr Physical;
 
         public ScreenLight Copy()
         {
-            return new ScreenLight { Device = Device, Name = Name, Bounds = Bounds, Ok = Ok, Percent = Percent, Max = Max };
+            return new ScreenLight { Device = Device, Id = Id, Name = Name, Bounds = Bounds, Ok = Ok, Percent = Percent, Max = Max,
+                Inputs = Inputs, Input = Input };
         }
     }
 
@@ -1166,7 +1245,7 @@ namespace Eclipse
             new Thread(Run) { IsBackground = true, Name = "Luminosité" }.Start();
         }
 
-        // Le nom d'un écran (\\.\DISPLAY1 -> « VG27A »), s'il est déjà connu ; sinon null. Sans attendre.
+        // Le nom d'un écran (\\.\DISPLAY1 -> son modèle, en général), s'il est déjà connu ; sinon null. Sans attendre.
         public string NameOf(string device)
         {
             string name;
@@ -1306,7 +1385,9 @@ namespace Eclipse
                     Device = info.Device,
                     Bounds = Rectangle.FromLTRB(info.Monitor.Left, info.Monitor.Top, info.Monitor.Right, info.Monitor.Bottom)
                 };
-                s.Name = NameFromWindows(info.Device, friendly);
+                string text;
+                s.Id = Ddc.MonitorId(info.Device, out text);
+                s.Name = NameFromWindows(info.Device, s.Id, text, friendly);
                 uint count;
                 if (Ddc.GetNumberOfPhysicalMonitorsFromHMONITOR(monitor, out count) && count > 0)
                 {
@@ -1339,25 +1420,102 @@ namespace Eclipse
             }
         }
 
-        // \\.\DISPLAY1 -> l'identifiant de l'écran branché (DISPLAY\SAM0F6A\5&...&UID...) -> son nom dans Windows.
-        static string NameFromWindows(string device, Dictionary<string, string> friendly)
+        // L'identifiant de l'écran branché (DISPLAY\ABC1234\5&...&UID...) -> son nom dans Windows.
+        static string NameFromWindows(string device, string id, string text, Dictionary<string, string> friendly)
         {
-            var dd = new Ddc.DISPLAY_DEVICE { Size = Marshal.SizeOf(typeof(Ddc.DISPLAY_DEVICE)) };
-            if (Ddc.EnumDisplayDevices(device, 0, ref dd, 1)) // EDD_GET_DEVICE_INTERFACE_NAME
-            {
-                string id = dd.Id ?? string.Empty;              // \\?\DISPLAY#SAM0F6A#5&...&UID4352#{e6f07b5f-...}
-                if (id.StartsWith(@"\\?\")) id = id.Substring(4);
-                int guid = id.IndexOf("#{", StringComparison.Ordinal);
-                if (guid > 0) id = id.Substring(0, guid);
-                id = id.Replace('#', '\\');
-                string name;
-                if (friendly.TryGetValue(id, out name)) return name;
-                if (!string.IsNullOrEmpty(dd.Text) && dd.Text.IndexOf("Generic", StringComparison.OrdinalIgnoreCase) < 0) return dd.Text;
-            }
+            string name;
+            if (id.Length > 0 && friendly.TryGetValue(id, out name)) return name;
+            if (!string.IsNullOrEmpty(text) && text.IndexOf("Generic", StringComparison.OrdinalIgnoreCase) < 0) return text;
             return "Écran " + Regex.Replace(device, @"\D", string.Empty);
         }
 
-        // Les noms donnés par les écrans eux-mêmes (« VG27A », « U2720Q »...), par WMI.
+        // ---- Les entrées des écrans, pour les consoles ----
+
+        // Les entrées de chaque écran (sa chaîne de capacités : 1 à 2 s par écran) et celle qu'il affiche, puis
+        // done(copies), sur ce fil.
+        public void ReadInputs(Action<List<ScreenLight>> done)
+        {
+            Post(delegate
+            {
+                Reload();
+                foreach (ScreenLight s in screens)
+                {
+                    if (s.Physical == IntPtr.Zero || !s.Ok) continue;
+                    s.Inputs = Inputs.FromCapabilities(Capabilities(s.Physical));
+                    if (s.Inputs != null) s.Input = ReadInput(s.Physical);
+                }
+                done(Copies());
+            });
+        }
+
+        // L'entrée qu'affiche un écran, puis done(son code, ou -1 s'il ne répond pas), sur ce fil.
+        public void GetInput(string id, Action<int> done)
+        {
+            Post(delegate
+            {
+                ScreenLight s = Find(id);
+                done(s == null ? -1 : ReadInput(s.Physical));
+            });
+        }
+
+        // Passe un écran sur une entrée, puis done(vrai si l'écran l'a acceptée), sur ce fil. Juste après un changement
+        // d'entrée ou d'écran principal, l'écran ne répond plus pendant 1 à 2 s : on réessaie pendant 5 s.
+        public void SetInput(string id, int code, Action<bool> done)
+        {
+            Post(delegate
+            {
+                var until = DateTime.UtcNow.AddSeconds(5);
+                ScreenLight s = Find(id);
+                int error = 0;
+                for (int attempt = 1; ; attempt++)
+                {
+                    if (s != null && Ddc.SetVCPFeature(s.Physical, Inputs.Code, (uint)code)) { if (done != null) done(true); return; }
+                    error = Marshal.GetLastWin32Error();
+                    if (DateTime.UtcNow > until) break;
+                    Thread.Sleep(300);
+                    if (s == null || attempt % 5 == 0) { Reload(); s = Find(id); } // un handle neuf, si Windows a refait l'écran
+                }
+                Journal.Write("Consoles : l'écran " + (s != null ? s.Name : "de la console") + " n'a pas pris l'entrée "
+                    + Inputs.NameOf(code) + (s == null ? " (débranché ?)." : " (erreur " + error + ")."));
+                if (done != null) done(false);
+            });
+        }
+
+        ScreenLight Find(string id)
+        {
+            if (screens.Count == 0) Reload();
+            int i = Ddc.FindScreen(screens.ConvertAll(s => s.Id), id);
+            return i < 0 || screens[i].Physical == IntPtr.Zero ? null : screens[i];
+        }
+
+        // Juste après un changement d'entrée, la réponse peut manquer : jusqu'à 6 essais.
+        static int ReadInput(IntPtr physical)
+        {
+            for (int attempt = 0; attempt < 6; attempt++)
+            {
+                uint current, max;
+                if (Ddc.GetVCPFeatureAndVCPFeatureReply(physical, Inputs.Code, IntPtr.Zero, out current, out max)) return (int)(current & 0xFF);
+                Thread.Sleep(300);
+            }
+            return -1;
+        }
+
+        static string Capabilities(IntPtr physical)
+        {
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                uint length;
+                if (Ddc.GetCapabilitiesStringLength(physical, out length) && length > 0)
+                {
+                    var caps = new StringBuilder((int)length);
+                    if (Ddc.CapabilitiesRequestAndCapabilitiesReply(physical, caps, length)) return caps.ToString();
+                }
+                Thread.Sleep(200);
+            }
+            return null;
+        }
+
+        // Les noms donnés par les écrans eux-mêmes (leur modèle, en général), par WMI.
         static Dictionary<string, string> FriendlyNames()
         {
             var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -1373,7 +1531,7 @@ namespace Eclipse
                         var sb = new StringBuilder();
                         foreach (ushort c in chars) if (c != 0) sb.Append((char)c);
                         if (sb.Length == 0) continue;
-                        instance = Regex.Replace(instance, @"_\d+$", string.Empty); // DISPLAY\SAM0F6A\5&...&UID4352_0
+                        instance = Regex.Replace(instance, @"_\d+$", string.Empty); // DISPLAY\ABC1234\5&...&UID1_0
                         map[instance] = sb.ToString().Trim();
                     }
             }
@@ -1389,46 +1547,625 @@ namespace Eclipse
         }
     }
 
+    // ---- Les consoles : passer un écran sur une console au clavier (DDC/CI, code 0x60), et revenir sur le PC ----
+
+    // Les entrées d'un écran, numérotées par la norme MCCS, et le raccourci proposé pour une console.
+    static class Inputs
+    {
+        public const byte Code = 0x60; // le code VCP de l'entrée
+
+        static readonly string[] Names = { null, "VGA 1", "VGA 2", "DVI 1", "DVI 2", "Composite 1", "Composite 2",
+            "S-Vidéo 1", "S-Vidéo 2", "Tuner 1", "Tuner 2", "Tuner 3", "Composante 1", "Composante 2", "Composante 3",
+            "DisplayPort 1", "DisplayPort 2", "HDMI 1", "HDMI 2" };
+
+        public static string NameOf(int code)
+        {
+            return code > 0 && code < Names.Length ? Names[code] : "Entrée " + code.ToString("X2");
+        }
+
+        // La liste du code 60 dans la partie vcp(...) de la chaîne de capacités : « vcp(10 14(05 08) 60(11 12 0F) 62) ».
+        // null si l'écran n'annonce pas le code 60 ; vide s'il l'annonce sans dire ses entrées.
+        public static int[] FromCapabilities(string caps)
+        {
+            int i = VcpStart(caps);
+            if (i < 0) return null;
+            for (int depth = 0; i < caps.Length; i++)
+            {
+                char c = caps[i];
+                if (c == '(') depth++;
+                else if (c == ')') { if (depth == 0) break; depth--; }
+                else if (depth == 0 && IsHex(c))
+                {
+                    int end = HexEnd(caps, i);
+                    bool sixty = end - i == 2 && caps[i] == '6' && caps[i + 1] == '0';
+                    i = end - 1;
+                    if (sixty) return List(caps, end);
+                }
+            }
+            return null;
+        }
+
+        // Juste après « vcp( » ; pas « vcpname( », qui donne des noms et non des codes.
+        static int VcpStart(string caps)
+        {
+            if (string.IsNullOrEmpty(caps)) return -1;
+            for (int i = caps.IndexOf("vcp", StringComparison.OrdinalIgnoreCase); i >= 0;
+                 i = caps.IndexOf("vcp", i + 3, StringComparison.OrdinalIgnoreCase))
+            {
+                if (i > 0 && char.IsLetter(caps[i - 1])) continue;
+                int j = i + 3;
+                while (j < caps.Length && caps[j] == ' ') j++;
+                if (j < caps.Length && caps[j] == '(') return j + 1;
+            }
+            return -1;
+        }
+
+        // Les codes entre parenthèses après « 60 », deux chiffres hexadécimaux chacun, collés ou non.
+        static int[] List(string caps, int i)
+        {
+            var codes = new List<int>();
+            while (i < caps.Length && caps[i] == ' ') i++;
+            if (i >= caps.Length || caps[i] != '(') return codes.ToArray();
+            for (i++; i < caps.Length && caps[i] != ')'; i++)
+            {
+                if (!IsHex(caps[i])) continue;
+                int end = HexEnd(caps, i);
+                for (int k = i; k + 1 < end; k += 2)
+                {
+                    int code = Convert.ToInt32(caps.Substring(k, 2), 16);
+                    if (!codes.Contains(code)) codes.Add(code);
+                }
+                i = end - 1;
+            }
+            return codes.ToArray();
+        }
+
+        static bool IsHex(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+
+        static int HexEnd(string s, int i)
+        {
+            while (i < s.Length && IsHex(s[i])) i++;
+            return i;
+        }
+
+        // Les prises à proposer dans le questionnaire : celles que l'écran annonce ; s'il annonce le code 60 sans sa liste,
+        // les prises courantes de la norme (« Voir » montre lesquelles existent). null : il ne change pas d'entrée.
+        public static int[] Offered(int[] announced)
+        {
+            if (announced == null || announced.Length > 0) return announced;
+            return new[] { 0x11, 0x12, 0x0F, 0x10 };
+        }
+    }
+
+    // Les raccourcis clavier : leur texte, ceux des consoles, et les combinaisons qui ne peuvent pas servir.
+    // Les modificateurs sont ceux de RegisterHotKey : MOD_ALT 1, MOD_CONTROL 2, MOD_SHIFT 4.
+    static class Hotkeys
+    {
+        public const uint Cas = Native.MOD_CONTROL | Native.MOD_ALT | Native.MOD_SHIFT; // Ctrl+Alt+Maj
+
+        // « Ctrl+Alt+Maj+X » : les lettres et les chiffres tels quels (pas « D1 »), les autres touches par leur nom.
+        public static string Text(uint mods, uint key)
+        {
+            var sb = new StringBuilder();
+            if ((mods & Native.MOD_CONTROL) != 0) sb.Append("Ctrl+");
+            if ((mods & Native.MOD_ALT) != 0) sb.Append("Alt+");
+            if ((mods & Native.MOD_SHIFT) != 0) sb.Append("Maj+");
+            return sb.Append(KeyName(key)).ToString();
+        }
+
+        static string KeyName(uint key)
+        {
+            if ((key >= 'A' && key <= 'Z') || (key >= '0' && key <= '9')) return ((char)key).ToString();
+            if (key >= (uint)Keys.NumPad0 && key <= (uint)Keys.NumPad9) return "Pavé " + (key - (uint)Keys.NumPad0);
+            switch ((Keys)key)
+            {
+                case Keys.Up: return "Haut";
+                case Keys.Down: return "Bas";
+                case Keys.Left: return "Gauche";
+                case Keys.Right: return "Droite";
+                case Keys.Escape: return "Échap";
+                case Keys.Space: return "Espace";
+                case Keys.Enter: return "Entrée";
+                case Keys.PageUp: return "Pg préc";
+                case Keys.PageDown: return "Pg suiv";
+                case Keys.Home: return "Début";
+                case Keys.End: return "Fin";
+                case Keys.Insert: return "Inser";
+                case Keys.Back: return "Ret. arrière";
+                case Keys.CapsLock: return "Verr. maj";
+                case Keys.Apps: return "Menu";
+            }
+            // Une touche de ponctuation : ce qu'elle écrit sur ce clavier (« ù », « $ ») ; sinon son nom (F5, Home…).
+            // 2 : MAPVK_VK_TO_CHAR ; le bit du haut marque une touche morte.
+            uint ch = Native.MapVirtualKeyEx(key, 2, Native.GetKeyboardLayout(0)) & 0x7FFF;
+            return ch > ' ' ? char.ToUpperInvariant((char)ch).ToString() : ((Keys)key).ToString();
+        }
+
+        // Les modificateurs relus dans le registre : au moins deux parmi Ctrl, Alt et Maj, sinon Ctrl+Alt+Maj. Jamais une
+        // touche seule, ou avec un seul modificateur : elle serait prise au clavier dans toutes les applis.
+        public static uint ModsFrom(object value)
+        {
+            uint mods = value is int ? (uint)(int)value & Cas : 0;
+            int count = 0;
+            for (uint bit = 1; bit <= 4; bit <<= 1) if ((mods & bit) != 0) count++;
+            return count >= 2 ? mods : Cas;
+        }
+
+        // Le raccourci d'une console, avec Ctrl+Alt+Maj : la première lettre (ou le premier chiffre) de son nom, sinon le
+        // premier chiffre libre ; 0 si tout est pris. B est à la lumière bleue ; taken : les touches déjà prises.
+        public static uint KeyFor(string name, ICollection<uint> taken)
+        {
+            string n = (name ?? string.Empty).Trim().ToUpperInvariant();
+            if (n.Length > 0)
+            {
+                char c = n[0];
+                if (((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) && c != 'B' && !taken.Contains(c)) return c;
+            }
+            for (char d = '1'; d <= '9'; d++) if (!taken.Contains(d)) return d;
+            return 0;
+        }
+
+        // Les raccourcis des lignes du questionnaire, dans l'ordre. Une ligne au raccourci choisi le garde ; les autres
+        // reçoivent Ctrl+Alt+Maj et la touche de KeyFor, qui évite taken et les raccourcis choisis. Une ligne sans nom
+        // n'a pas de raccourci, ni de choix : son nom retapé reçoit la lettre automatique.
+        public static void Assign(List<ConsoleInput> list, ICollection<uint> taken)
+        {
+            var used = new List<uint>(taken);
+            foreach (ConsoleInput c in list)
+                if (c.Chosen && c.Mods == Cas && c.Name.Trim().Length > 0) used.Add(c.Key);
+            foreach (ConsoleInput c in list)
+            {
+                if (c.Name.Trim().Length == 0) { c.Chosen = false; c.Mods = Cas; c.Key = 0; continue; }
+                if (c.Chosen) continue;
+                c.Mods = Cas;
+                c.Key = KeyFor(c.Name, used);
+                if (c.Key != 0) used.Add(c.Key);
+            }
+        }
+
+        // Ce qu'une combinaison fait déjà dans Eclipse, ou null. Le raccourci principal, qui se change, n'en est pas.
+        public static string InEclipse(uint mods, uint key)
+        {
+            if (mods != Cas) return null;
+            if (key == (uint)Keys.B) return "la lumière bleue";
+            if (key == Native.VK_UP || key == Native.VK_DOWN) return "la luminosité";
+            if (key == Native.VK_ESCAPE) return "la sortie de secours";
+            return null;
+        }
+
+        // Ce qu'AltGr (Ctrl+Alt) écrit avec cette touche sur ce clavier, ou null. Un raccourci Ctrl+Alt+<touche> empêcherait
+        // de l'écrire : « € » avec E, « @ » avec 0 sur un clavier français.
+        public static string AltGrChar(uint mods, uint key, IntPtr layout)
+        {
+            const uint altGr = Native.MOD_CONTROL | Native.MOD_ALT;
+            if ((mods & altGr) != altGr) return null;
+            var state = new byte[256];
+            state[0x11] = state[0x12] = 0x80; // VK_CONTROL, VK_MENU
+            if ((mods & Native.MOD_SHIFT) != 0) state[0x10] = 0x80; // VK_SHIFT
+            var text = new char[8];
+            // 4 : sans toucher à l'état du clavier (une touche morte en attente) ; < 0 : une touche morte, qui écrit aussi.
+            int n = Native.ToUnicodeEx(key, Native.MapVirtualKeyEx(key, 0, layout), state, text, text.Length, 4, layout);
+            if (n < 0) n = 1;
+            return n > 0 && text[0] >= ' ' ? new string(text, 0, Math.Min(n, text.Length)) : null;
+        }
+
+        // Pourquoi une combinaison ne peut pas servir de raccourci, ou null : elle sert déjà dans Eclipse, ou AltGr
+        // l'utilise pour écrire.
+        public static string Refusal(uint mods, uint key, IntPtr layout)
+        {
+            string use = InEclipse(mods, key);
+            if (use != null) return Text(mods, key) + " sert déjà à " + use + ".";
+            string ch = AltGrChar(mods, key, layout);
+            if (ch == null) return null;
+            return Text(mods, key) + " empêcherait d'écrire « " + ch + " » (AltGr+" + ((mods & Native.MOD_SHIFT) != 0 ? "Maj+" : string.Empty)
+                + KeyName(key) + ").";
+        }
+
+        // Pourquoi une combinaison ne peut pas aller à une console, ou null : c'est le raccourci principal (mainMods,
+        // mainKey), ou Refusal.
+        public static string ForConsole(uint mods, uint key, uint mainMods, uint mainKey, IntPtr layout)
+        {
+            if (mods == mainMods && key == mainKey) return Text(mods, key) + " sert déjà à éteindre les écrans.";
+            return Refusal(mods, key, layout);
+        }
+
+        // Pourquoi une combinaison ne peut pas devenir le raccourci principal, ou null : une console l'a, ou Refusal.
+        public static string ForMain(uint mods, uint key, List<ConsoleInput> consoles, IntPtr layout)
+        {
+            ConsoleInput c = consoles.Find(x => x.Key == key && x.Mods == mods);
+            if (c != null) return Text(mods, key) + " sert déjà à " + c.Name + ".";
+            return Refusal(mods, key, layout);
+        }
+    }
+
+    // Ce que montre l'écran du jeu, d'après l'entrée lue : une console réglée, le PC, ou rien de sûr.
+    enum Seen { Nothing, Console, Pc }
+
+    // Une console : une entrée d'un écran, nommée dans le questionnaire, et son raccourci (Mods + Key).
+    // Rangées dans HKCU\Software\Eclipse\Consoles\1, 2... : Nom, Ecran, Entree, EntreePC, Touche, Modificateurs, Choisi.
+    class ConsoleInput
+    {
+        const string RegKey = @"Software\Eclipse\Consoles";
+        public string Name = string.Empty; // « Xbox »
+        public string Screen = string.Empty; // l'identifiant de l'écran (Ddc.MonitorId)
+        public int Input;                  // l'entrée de la console (0x11 : HDMI 1)
+        public int Home;                   // l'entrée du PC sur cet écran (0x0F : DisplayPort 1)
+        public uint Mods = Hotkeys.Cas;    // Ctrl+Alt+Maj, sauf un raccourci choisi
+        public uint Key;                   // 0 : pas de raccourci
+        public bool Chosen;                // raccourci choisi dans le questionnaire : il ne suit plus le nom
+        public bool Refused;               // le raccourci est déjà pris par une autre appli (pas rangé dans le registre)
+
+        public string Shortcut { get { return Key == 0 ? string.Empty : Hotkeys.Text(Mods, Key); } }
+
+        // Le raccourci à annoncer (menu, message, panneau), ou null : pas de touche, ou touche prise ailleurs.
+        public string WorkingShortcut { get { return Key != 0 && !Refused ? Shortcut : null; } }
+
+        // L'entrée lue sur l'écran du jeu (code < 0 : pas de réponse). Une seule règle, pour la lecture des 3 s comme au
+        // démarrage : le jeu ne se termine que si l'écran montre l'entrée du PC. Pas de réponse (erreur passagère juste
+        // après une bascule, écran pas encore prêt) ou une prise sans console : on attend. Plus aucune console réglée
+        // sur cet écran : le jeu n'a plus de sens, c'est le PC.
+        public static Seen Read(int code, string screen, List<ConsoleInput> consoles, out ConsoleInput shown)
+        {
+            List<ConsoleInput> mine = consoles.FindAll(c => string.Equals(c.Screen, screen, StringComparison.OrdinalIgnoreCase));
+            shown = code < 0 ? null : mine.Find(c => c.Input == code);
+            if (shown != null) return Seen.Console;
+            if (mine.Count == 0 || mine.Exists(c => c.Home == code)) return Seen.Pc;
+            return Seen.Nothing;
+        }
+
+        public static List<ConsoleInput> Load()
+        {
+            var list = new List<ConsoleInput>();
+            try
+            {
+                using (RegistryKey root = Registry.CurrentUser.OpenSubKey(RegKey))
+                {
+                    if (root == null) return list;
+                    string[] names = root.GetSubKeyNames();
+                    Array.Sort(names, (a, b) => Number(a).CompareTo(Number(b)));
+                    foreach (string sub in names)
+                        using (RegistryKey k = root.OpenSubKey(sub))
+                        {
+                            var c = new ConsoleInput
+                            {
+                                Name = k.GetValue("Nom") as string ?? string.Empty,
+                                Screen = k.GetValue("Ecran") as string ?? string.Empty,
+                                Input = k.GetValue("Entree") is int ? (int)k.GetValue("Entree") : 0,
+                                Home = k.GetValue("EntreePC") is int ? (int)k.GetValue("EntreePC") : 0,
+                                Key = k.GetValue("Touche") is int ? (uint)(int)k.GetValue("Touche") : 0,
+                                Mods = Hotkeys.ModsFrom(k.GetValue("Modificateurs")),
+                                Chosen = k.GetValue("Choisi") is int && (int)k.GetValue("Choisi") != 0
+                            };
+                            if (c.Name.Trim().Length > 0 && c.Screen.Length > 0 && c.Input > 0 && c.Home > 0 && c.Input != c.Home) list.Add(c);
+                        }
+                }
+            }
+            catch (Exception e) { Journal.Write("Consoles : réglages illisibles (" + e.Message + ")."); }
+            return list;
+        }
+
+        static int Number(string s)
+        {
+            int n;
+            return int.TryParse(s, out n) ? n : int.MaxValue;
+        }
+
+        public static void Save(List<ConsoleInput> list)
+        {
+            try
+            {
+                Registry.CurrentUser.DeleteSubKeyTree(RegKey, false);
+                using (RegistryKey root = Registry.CurrentUser.CreateSubKey(RegKey))
+                    for (int i = 0; i < list.Count; i++)
+                        using (RegistryKey k = root.CreateSubKey((i + 1).ToString()))
+                        {
+                            k.SetValue("Nom", list[i].Name);
+                            k.SetValue("Ecran", list[i].Screen);
+                            k.SetValue("Entree", list[i].Input);
+                            k.SetValue("EntreePC", list[i].Home);
+                            k.SetValue("Touche", (int)list[i].Key);
+                            k.SetValue("Modificateurs", (int)list[i].Mods);
+                            k.SetValue("Choisi", list[i].Chosen ? 1 : 0);
+                        }
+            }
+            catch (Exception e) { Journal.Write("Consoles : réglages non enregistrés (" + e.Message + ")."); }
+        }
+    }
+
+    // L'écran principal : celui de la barre des tâches, des nouvelles fenêtres et des notifications. Pendant le jeu sur
+    // l'écran principal, son voisin le devient, comme avec « Faire de cet écran l'écran principal » dans Windows, qui
+    // l'enregistre. Si Eclipse s'arrête pendant le jeu, une valeur dans le registre permet de tout remettre au
+    // démarrage suivant (App.ResumeGame). Tout est lu à l'instant (Ddc.Monitors).
+    static class PrimaryScreen
+    {
+        // Les structures de SetDisplayConfig (wingdi.h), à la taille exacte attendue par Windows : 72, 64 et 84 octets.
+        [StructLayout(LayoutKind.Sequential)] internal struct LUID { public uint Low; public int High; }
+
+        [StructLayout(LayoutKind.Sequential)] internal struct PathSource { public LUID Adapter; public uint Id, ModeIndex, Status; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct PathTarget
+        {
+            public LUID Adapter;
+            public uint Id, ModeIndex, Technology, Rotation, Scaling, RefreshNumerator, RefreshDenominator, ScanLine;
+            public int Available;
+            public uint Status;
+        }
+
+        [StructLayout(LayoutKind.Sequential)] internal struct PathInfo { public PathSource Source; public PathTarget Target; public uint Flags; }
+
+        // Un mode de la disposition ; seuls les champs d'un mode « source » (la place d'un écran sur le bureau) sont nommés.
+        [StructLayout(LayoutKind.Explicit, Size = 64)]
+        internal struct ModeInfo
+        {
+            [FieldOffset(0)] public uint Type;
+            [FieldOffset(28)] public int X;
+            [FieldOffset(32)] public int Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        internal struct SourceName
+        {
+            public int Type, Size;
+            public LUID Adapter;
+            public uint Id;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string Device;
+        }
+
+        const uint OnlyActivePaths = 0x2, UseSupplied = 0x20, Apply = 0x80, SaveToDatabase = 0x200, AllowChanges = 0x400, SourceMode = 1;
+        const int GetSourceName = 1, InsufficientBuffer = 122;
+        [DllImport("user32.dll")] static extern int GetDisplayConfigBufferSizes(uint flags, out uint paths, out uint modes);
+        [DllImport("user32.dll")] static extern int QueryDisplayConfig(uint flags, ref uint numPaths, [Out] PathInfo[] paths, ref uint numModes, [Out] ModeInfo[] modes, IntPtr topology);
+        [DllImport("user32.dll")] static extern int SetDisplayConfig(uint numPaths, [In] PathInfo[] paths, uint numModes, [In] ModeInfo[] modes, uint flags);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int DisplayConfigGetDeviceInfo(ref SourceName info);
+
+        static bool Same(string a, string b) { return string.Equals(a, b, StringComparison.OrdinalIgnoreCase); }
+
+        public static bool IsPrimary(string device)
+        {
+            return Ddc.Monitors().Exists(m => Same(m.Device, device) && (m.Flags & 1) != 0);
+        }
+
+        // Le voisin de cet écran (le plus proche, de centre à centre), qui sera principal pendant le jeu ; null s'il est seul.
+        public static string Neighbour(string device)
+        {
+            List<Ddc.MONITORINFOEX> all = Ddc.Monitors();
+            int me = all.FindIndex(m => Same(m.Device, device));
+            if (me < 0) return null;
+            string best = null;
+            double nearest = double.MaxValue;
+            foreach (Ddc.MONITORINFOEX m in all)
+            {
+                if (Same(m.Device, device)) continue;
+                double dx = (m.Monitor.Left + m.Monitor.Right - all[me].Monitor.Left - all[me].Monitor.Right) / 2.0;
+                double dy = (m.Monitor.Top + m.Monitor.Bottom - all[me].Monitor.Top - all[me].Monitor.Bottom) / 2.0;
+                double d = dx * dx + dy * dy;
+                if (d < nearest) { nearest = d; best = m.Device; }
+            }
+            return best;
+        }
+
+        // Fait de cet écran (\\.\DISPLAY1) l'écran principal : il passe en (0, 0) et les autres gardent leur place autour,
+        // en un seul changement. SetDisplayConfig est la voie de la page Paramètres : ChangeDisplaySettingsEx refusait
+        // (code -1) de remettre l'écran principal après un changement d'entrée de cet écran (essai du 17/11/2026).
+        public static bool Set(string device)
+        {
+            if (IsPrimary(device)) return true;
+            PathInfo[] paths = null;
+            ModeInfo[] modes = null;
+            uint np = 0, nm = 0;
+            int read = InsufficientBuffer;
+            for (int tries = 0; tries < 3 && read == InsufficientBuffer; tries++) // la disposition peut changer entre les deux appels
+            {
+                read = GetDisplayConfigBufferSizes(OnlyActivePaths, out np, out nm);
+                if (read != 0) break;
+                paths = new PathInfo[np];
+                modes = new ModeInfo[nm];
+                read = QueryDisplayConfig(OnlyActivePaths, ref np, paths, ref nm, modes, IntPtr.Zero);
+            }
+            if (read != 0) { Journal.Write("Écran principal : disposition des écrans illisible (" + read + ")."); return false; }
+            int target = -1;
+            for (int i = 0; i < np && target < 0; i++)
+            {
+                uint m = paths[i].Source.ModeIndex;
+                if (m < nm && modes[m].Type == SourceMode && Same(SourceDevice(paths[i].Source), device)) target = (int)m;
+            }
+            if (target < 0) { Journal.Write("Écran principal : " + device + " introuvable."); return false; }
+            int dx = modes[target].X, dy = modes[target].Y;
+            for (int i = 0; i < nm; i++)
+                if (modes[i].Type == SourceMode) { modes[i].X -= dx; modes[i].Y -= dy; }
+            int result = SetDisplayConfig(np, paths, nm, modes, UseSupplied | Apply | SaveToDatabase | AllowChanges);
+            if (result != 0) Journal.Write("Écran principal : Windows refuse le changement (" + result + ").");
+            return result == 0;
+        }
+
+        // Le nom (\\.\DISPLAY1) de l'écran d'une source de la disposition, ou null.
+        static string SourceDevice(PathSource source)
+        {
+            var name = new SourceName { Type = GetSourceName, Size = Marshal.SizeOf(typeof(SourceName)), Adapter = source.Adapter, Id = source.Id };
+            return DisplayConfigGetDeviceInfo(ref name) == 0 ? name.Device : null;
+        }
+
+        // L'écran (\\.\DISPLAY1) qui porte cet identifiant, ou null s'il n'est pas branché.
+        public static string DeviceOf(string id)
+        {
+            List<Ddc.MONITORINFOEX> all = Ddc.Monitors();
+            List<string> ids = all.ConvertAll(m => Ddc.MonitorId(m.Device));
+            int i = Ddc.FindScreen(ids, id);
+            return i < 0 ? null : all[i].Device;
+        }
+    }
+
+    // Le filtre de la lumière bleue : jamais, seulement sous le minimum de l'écran, ou tout le temps.
+    enum BlueFilter { Non, SousLeMin, Toujours }
+
     // Sous le minimum de l'écran : l'image elle-même est assombrie, par l'effet de couleur plein écran de Windows (celui
     // de la loupe et des filtres de couleur). Pas de fenêtre posée par-dessus : rien ne cache, rien ne bloque les clics,
     // et l'effet disparaît de lui-même si Eclipse s'arrête, même brutalement. Il vaut pour tous les écrans à la fois.
     // Essais du 15/11 : la table de gamma de Windows refuse d'assombrir de plus de 50 % ; l'effet de couleur, lui, va
     // aussi bas qu'on veut. On s'arrête à 90 % (Max), pour que l'image ne disparaisse jamais tout à fait.
     // Ce n'est pas plus de lumière économisée : le rétroéclairage reste au minimum, l'image devient plus sombre.
+    // Le même effet filtre la lumière bleue : une seule matrice porte l'assombrissement et la chaleur de l'image.
+    // L'éclairage nocturne de Windows ne se commande pas depuis un programme (aucun moyen officiel) ; s'il est allumé,
+    // les deux filtres s'additionnent.
     // Toujours sur le fil principal (celui de l'icône), le seul qui appelle la loupe.
     class Dimmer : IDisposable
     {
         public const int Max = 90;
+        const int FullWarmthAt = 30; // « sous le minimum » : la chaleur choisie est atteinte à −30 %
+        const string RegKey = @"Software\Eclipse";
         [DllImport("magnification.dll")] static extern bool MagInitialize();
         [DllImport("magnification.dll")] static extern bool MagUninitialize();
         [DllImport("magnification.dll")] static extern bool MagSetFullscreenColorEffect(float[] matrix);
-        bool ready, failed;
-        int level;
+        bool ready, failed, previewing;
+        int level, warmth;
+        int chaleur = 50;
+        BlueFilter mode, usual; // usual : le choix d'avant Ctrl+Alt+Maj+B, jamais « Toujours »
 
-        public int Level { get { return level; } } // 0 : rien ; 30 : l'image à 70 % de sa lumière
+        public Dimmer()
+        {
+            Load();
+            if (mode == BlueFilter.Toujours) Apply(0);
+        }
 
-        public bool Set(int dim)
+        public int Level { get { return level; } }     // 0 : rien ; 30 : l'image à 70 % de sa lumière
+        public int Warmth { get { return warmth; } }   // la chaleur posée en ce moment, de 0 à 100 %
+        public BlueFilter Mode { get { return mode; } }
+        public int Chaleur { get { return chaleur; } } // la chaleur choisie, de 0 à 100 %
+
+        public bool Set(int dim) { return Apply(dim); }
+
+        public void SetMode(BlueFilter value)
+        {
+            mode = value;
+            if (value != BlueFilter.Toujours) usual = value;
+            Save();
+            Apply(level);
+        }
+
+        // Enregistrée par Save, à la fermeture du panneau : pas d'écriture à chaque pas du curseur.
+        public void SetChaleur(int value)
+        {
+            chaleur = Math.Max(0, Math.Min(100, value));
+            Apply(level);
+        }
+
+        // Le temps de régler la chaleur, on la montre, même si le filtre attend d'être sous le minimum.
+        public void Preview(bool on)
+        {
+            previewing = on;
+            Apply(level);
+        }
+
+        // Ctrl+Alt+Maj+B : le filtre tout de suite, ou le retour au choix habituel.
+        public void Toggle()
+        {
+            SetMode(Toggled(mode, usual));
+        }
+
+        public static BlueFilter Toggled(BlueFilter mode, BlueFilter usual)
+        {
+            return mode == BlueFilter.Toujours ? usual : BlueFilter.Toujours;
+        }
+
+        // La chaleur à poser (0 à 100 %) selon le choix, la chaleur choisie et l'assombrissement (0 à 90).
+        public static int TargetWarmth(BlueFilter mode, int chaleur, int dim, bool previewing)
+        {
+            if (previewing || mode == BlueFilter.Toujours) return chaleur;
+            if (mode == BlueFilter.SousLeMin) return chaleur * Math.Min(dim, FullWarmthAt) / FullWarmthAt;
+            return 0;
+        }
+
+        bool Apply(int dim)
         {
             dim = Math.Max(0, Math.Min(Max, dim));
-            if (dim == level) return true;
+            int warm = TargetWarmth(mode, chaleur, dim, previewing);
+            if (dim == level && warm == warmth) return true;
             if (!ready)
             {
-                if (dim == 0) return true;
+                if (dim == 0 && warm == 0) return true;
                 if (failed) return false;
-                if (!MagInitialize()) { failed = true; Journal.Write("Assombrissement impossible : la loupe de Windows refuse."); return false; }
+                if (!MagInitialize()) { failed = true; Journal.Write("Effet de couleur impossible : la loupe de Windows refuse."); return false; }
                 ready = true;
             }
-            float k = 1f - dim / 100f;
+            float k = 1f - dim / 100f, r, g, b;
+            Tint(warm, out r, out g, out b);
             var m = new float[25];
-            m[0] = m[6] = m[12] = k;  // rouge, vert, bleu
-            m[18] = m[24] = 1f;       // transparence, et la ligne fixe
-            if (!MagSetFullscreenColorEffect(m)) { Journal.Write("Assombrissement : l'effet de couleur a été refusé."); return false; }
+            m[0] = k * r; m[6] = k * g; m[12] = k * b; // rouge, vert, bleu
+            m[18] = m[24] = 1f;                         // transparence, et la ligne fixe
+            if (!MagSetFullscreenColorEffect(m)) { Journal.Write("L'effet de couleur a été refusé par Windows."); return false; }
             level = dim;
-            if (dim == 0) { MagUninitialize(); ready = false; }
+            warmth = warm;
+            if (dim == 0 && warm == 0) { MagUninitialize(); ready = false; }
             return true;
         }
 
-        public void Dispose() { Set(0); }
+        // La chaleur en couleur : de 6500 K (blanc) à 1900 K (plus de bleu du tout), en ligne droite sur l'échelle des
+        // mireds (1 000 000 / K), plus proche de ce que l'œil perçoit. Les couleurs du corps noir viennent de
+        // l'approximation de Tanner Helland, ramenées à 6500 K = blanc.
+        static void Tint(int warm, out float r, out float g, out float b)
+        {
+            double mired = 1e6 / 6500 + (1e6 / 1900 - 1e6 / 6500) * warm / 100.0, r0, g0, b0, r1, g1, b1;
+            Blackbody(6500, out r0, out g0, out b0);
+            Blackbody(1e6 / mired, out r1, out g1, out b1);
+            r = (float)Math.Min(1, r1 / r0);
+            g = (float)Math.Min(1, g1 / g0);
+            b = (float)Math.Min(1, b1 / b0);
+        }
+
+        static void Blackbody(double kelvin, out double r, out double g, out double b)
+        {
+            double t = kelvin / 100;
+            r = t <= 66 ? 255 : 329.698727446 * Math.Pow(t - 60, -0.1332047592);
+            g = t <= 66 ? 99.4708025861 * Math.Log(t) - 161.1195681661 : 288.1221695283 * Math.Pow(t - 60, -0.0755148492);
+            b = t >= 66 ? 255 : t <= 19 ? 0 : 138.5177312231 * Math.Log(t - 10) - 305.0447927307;
+            r = Math.Max(0, Math.Min(255, r));
+            g = Math.Max(0, Math.Min(255, g));
+            b = Math.Max(0, Math.Min(255, b));
+        }
+
+        void Load()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegKey))
+                {
+                    if (key == null) return;
+                    mode = (BlueFilter)ReadInt(key, "FiltreBleu", 0, 0, 2);
+                    usual = (BlueFilter)ReadInt(key, "FiltreBleuHabituel", 0, 0, 1);
+                    chaleur = ReadInt(key, "Chaleur", chaleur, 0, 100);
+                }
+            }
+            catch (Exception e) { Journal.Write("Lumière bleue : réglages illisibles (" + e.Message + ")."); }
+        }
+
+        static int ReadInt(RegistryKey key, string name, int fallback, int min, int max)
+        {
+            object v = key.GetValue(name);
+            return v is int ? Math.Max(min, Math.Min(max, (int)v)) : fallback;
+        }
+
+        public void Save()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegKey))
+                {
+                    key.SetValue("FiltreBleu", (int)mode);
+                    key.SetValue("FiltreBleuHabituel", (int)usual);
+                    key.SetValue("Chaleur", chaleur);
+                }
+            }
+            catch (Exception e) { Journal.Write("Lumière bleue : réglages non enregistrés (" + e.Message + ")."); }
+        }
+
+        // L'image revient telle quelle ; le choix enregistré, lui, ne change pas.
+        public void Dispose()
+        {
+            mode = BlueFilter.Non;
+            previewing = false;
+            Apply(0);
+        }
     }
 
     // Un curseur sombre, à la Windows 11 : glisser, molette (±5), flèches (±1), Page haut / bas (±10).
@@ -1443,7 +2180,18 @@ namespace Eclipse
         int value;
         int minimum;
         bool dragging;
+        Color accent = Fill;
+        string message;
         public event EventHandler ValueChanged; // seulement quand c'est vous qui le bougez
+
+        public Color Accent { get { return accent; } set { accent = value; Invalidate(); } }
+
+        // Le texte montré à la place de la barre quand le curseur est grisé : un écran qui ne répond pas.
+        public string Message
+        {
+            get { return message; }
+            set { message = value; AccessibleDescription = value; Invalidate(); }
+        }
 
         public int Minimum
         {
@@ -1452,7 +2200,7 @@ namespace Eclipse
         }
 
         // Le dessin du curseur, partagé avec le rappel en bas de l'écran.
-        public static void PaintBar(Graphics g, RectangleF area, int minimum, int value, float thick, bool enabled, Font small, bool showMin)
+        public static void PaintBar(Graphics g, RectangleF area, int minimum, int value, float thick, bool enabled, Font small, bool showMin, Color accent)
         {
             float cy = area.Top + area.Height / 2f;
             Func<int, float> at = v => area.Left + area.Width * (v - minimum) / (float)(100 - minimum);
@@ -1462,7 +2210,7 @@ namespace Eclipse
             if (minimum < 0)
                 using (var below = new Pen(BelowTrack, thick) { StartCap = LineCap.Round, EndCap = LineCap.Flat })
                     g.DrawLine(below, area.Left, cy, zero, cy);
-            Color fill = !enabled ? Track : value < 0 ? Below : Fill;
+            Color fill = !enabled ? Track : value < 0 ? Below : accent;
             using (var pen = new Pen(fill, thick) { StartCap = LineCap.Round, EndCap = LineCap.Round })
             {
                 if (value > 0) g.DrawLine(pen, minimum < 0 ? zero : area.Left, cy, x, cy);
@@ -1485,12 +2233,30 @@ namespace Eclipse
                 | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
             TabStop = true;
             Cursor = Cursors.Hand;
+            AccessibleRole = AccessibleRole.Slider;
         }
 
         public int Value
         {
             get { return value; }
-            set { int v = Math.Max(minimum, Math.Min(100, value)); if (v != this.value) { this.value = v; Invalidate(); } }
+            set
+            {
+                int v = Math.Max(minimum, Math.Min(100, value));
+                if (v == this.value) return;
+                this.value = v;
+                Invalidate();
+                AccessibilityNotifyClients(AccessibleEvents.ValueChange, -1);
+            }
+        }
+
+        // Pour un lecteur d'écran : « 40 % », ou « −30 % » sous le minimum.
+        protected override AccessibleObject CreateAccessibilityInstance() { return new Access(this); }
+
+        class Access : ControlAccessibleObject
+        {
+            readonly Slider owner;
+            public Access(Slider owner) : base(owner) { this.owner = owner; }
+            public override string Value { get { int v = owner.Value; return (v < 0 ? "−" + (-v) : v.ToString()) + " %"; } }
         }
 
         void SetByUser(int v)
@@ -1518,12 +2284,19 @@ namespace Eclipse
         {
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(Parent != null ? Parent.BackColor : BackColor);
+            g.Clear(BackColor); // celui du parent, sauf si le panneau en donne un autre (une carte)
             int r = Radius, cy = BarHeight / 2, w = Width - 2 * r, thick = Math.Max(3, BarHeight / 8);
-            using (var small = new Font("Segoe UI", 7.5f))
-                PaintBar(g, new RectangleF(r, 0, w, BarHeight), minimum, value, thick, Enabled, small, true);
+            if (!Enabled && !string.IsNullOrEmpty(message))
+            {
+                using (var f = new Font(Ui.TextFont, 9f))
+                    TextRenderer.DrawText(g, message, f, new Rectangle(r, 0, w, BarHeight), Ui.Dim, BackColor,
+                        TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+                return;
+            }
+            using (var small = new Font(Ui.TextFont, 7.5f))
+                PaintBar(g, new RectangleF(r, 0, w, BarHeight), minimum, value, thick, Enabled, small, true, accent);
             float x = r + w * (value - minimum) / (float)(100 - minimum);
-            Color fill = !Enabled ? Track : value < 0 ? Below : Fill;
+            Color fill = !Enabled ? Track : value < 0 ? Below : accent;
             using (var outer = new SolidBrush(Color.FromArgb(69, 69, 69)))
                 g.FillEllipse(outer, x - r, cy - r, 2 * r, 2 * r);
             float inner = r * (Focused || dragging ? 0.62f : 0.5f);
@@ -1581,22 +2354,421 @@ namespace Eclipse
         protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
     }
 
-    // Le panneau qui s'ouvre d'un clic sur l'icône, près de l'heure : un curseur par écran, de gauche à droite.
+    // ---- Le style des panneaux : à la Windows 11, en sombre ----
+
+    static class Ui
+    {
+        public static readonly Color Back = Color.FromArgb(32, 32, 32);   // le fond des panneaux
+        public static readonly Color Card = Color.FromArgb(43, 43, 43);   // le fond d'une carte
+        public static readonly Color Line = Color.FromArgb(60, 60, 60);   // les traits et les bordures
+        public static readonly Color Text = Color.White;
+        public static readonly Color Dim = Color.FromArgb(170, 170, 170); // le texte secondaire
+        public static readonly Color Button = Color.FromArgb(50, 50, 50);
+        public static readonly Color Hover = Color.FromArgb(64, 64, 64);
+        public static readonly Color Pressed = Color.FromArgb(40, 40, 40);
+        public static readonly Color Chosen = Color.FromArgb(84, 84, 84); // une pastille grise choisie (« Non »)
+        public static readonly Color Warm = Color.FromArgb(255, 183, 77); // la chaleur du filtre, ambre
+        // Les icônes viennent de la police d'icônes de Windows : Segoe Fluent Icons (Windows 11), sinon Segoe MDL2 Assets.
+        public const string Sun = "", Moon = "", Power = "", Game = "";
+        public static readonly string TextFont = Pick("Segoe UI Variable Text", "Segoe UI");
+        public static readonly string StrongFont = Pick("Segoe UI Variable Text Semibold", "Segoe UI Semibold");
+        public static readonly string IconFont = Pick("Segoe Fluent Icons", "Segoe MDL2 Assets");
+
+        // Une police absente est remplacée sans prévenir par une autre : on vérifie le nom obtenu.
+        static string Pick(string wanted, string fallback)
+        {
+            try { using (var f = new Font(wanted, 10f)) return f.Name == wanted ? wanted : fallback; }
+            catch (ArgumentException) { return fallback; }
+        }
+
+        public static GraphicsPath Round(RectangleF r, float radius)
+        {
+            var p = new GraphicsPath();
+            float d = Math.Min(2 * radius, Math.Min(r.Width, r.Height));
+            if (d <= 0) { p.AddRectangle(r); return p; }
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        // La barre de titre en sombre (Windows 10 2004 et plus : 20 ; avant : 19).
+        public static void DarkTitle(IntPtr hwnd)
+        {
+            try
+            {
+                int dark = 1;
+                if (Ddc.DwmSetWindowAttribute(hwnd, 20, ref dark, 4) != 0) Ddc.DwmSetWindowAttribute(hwnd, 19, ref dark, 4);
+            }
+            catch (DllNotFoundException) { }
+            catch (EntryPointNotFoundException) { }
+        }
+
+        // Le contour du focus, seulement quand on se déplace au clavier (Tab).
+        public static void FocusRing(Graphics g, RectangleF r, float radius)
+        {
+            using (GraphicsPath path = Round(r, radius))
+            using (var pen = new Pen(Color.White, 1.5f))
+                g.DrawPath(pen, path);
+        }
+
+        // La place d'un écran parmi count, de gauche à droite : « à gauche, principal », « au milieu »... ; vide s'il est seul.
+        public static string Place(int i, int count, bool primary)
+        {
+            string where = count == 1 ? string.Empty : i == 0 ? "à gauche" : i == count - 1 ? "à droite" : "au milieu";
+            if (primary) where = where.Length == 0 ? "principal" : where + ", principal";
+            return where;
+        }
+    }
+
+    // Un interrupteur à la Windows 11 : un clic, ou Espace. Son texte est dans une étiquette à côté, qui le bascule aussi.
+    class Toggle : Control
+    {
+        bool on, hover;
+        public event EventHandler CheckedChanged; // seulement quand c'est vous qui le basculez
+
+        public Toggle()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            SetStyle(ControlStyles.StandardDoubleClick, false); // deux clics rapides basculent deux fois
+            TabStop = true;
+            Cursor = Cursors.Hand;
+            AccessibleRole = AccessibleRole.CheckButton;
+        }
+
+        public bool Checked
+        {
+            get { return on; }
+            set
+            {
+                if (value == on) return;
+                on = value;
+                Invalidate();
+                AccessibilityNotifyClients(AccessibleEvents.StateChange, -1);
+            }
+        }
+
+        public void Flip()
+        {
+            Checked = !on;
+            if (CheckedChanged != null) CheckedChanged(this, EventArgs.Empty);
+        }
+
+        protected override void OnMouseClick(MouseEventArgs e)
+        {
+            base.OnMouseClick(e);
+            if (e.Button != MouseButtons.Left) return;
+            Focus();
+            Flip();
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            if (e.KeyCode == Keys.Space) { Flip(); e.Handled = true; }
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hover = true; Invalidate(); }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hover = false; Invalidate(); }
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.Clear(BackColor);
+            float h = Math.Min(Height - 6f, Width / 2f - 3f), w = 2 * h, x = Width - w - 3, y = (Height - h) / 2f;
+            var track = new RectangleF(x, y, w, h);
+            Color off = hover ? Color.FromArgb(220, 220, 220) : Color.FromArgb(165, 165, 165);
+            using (GraphicsPath path = Ui.Round(track, h / 2))
+            {
+                if (on) using (var brush = new SolidBrush(Enabled ? Slider.Fill : Slider.Track)) g.FillPath(brush, path);
+                else using (var pen = new Pen(off, Math.Max(1f, h / 16))) g.DrawPath(pen, path);
+            }
+            float d = h * (hover ? 0.62f : 0.52f), cx = on ? x + w - h / 2 : x + h / 2;
+            using (var knob = new SolidBrush(on ? Color.Black : off))
+                g.FillEllipse(knob, cx - d / 2, y + (h - d) / 2, d, d);
+            if (Focused && ShowFocusCues) Ui.FocusRing(g, RectangleF.Inflate(track, 2.5f, 2.5f), h / 2 + 2.5f);
+        }
+
+        protected override AccessibleObject CreateAccessibilityInstance() { return new Access(this); }
+
+        class Access : ControlAccessibleObject
+        {
+            readonly Toggle owner;
+            public Access(Toggle owner) : base(owner) { this.owner = owner; }
+            public override AccessibleStates State { get { return owner.on ? base.State | AccessibleStates.Checked : base.State; } }
+            public override string DefaultAction { get { return owner.on ? "Désactiver" : "Activer"; } }
+            public override void DoDefaultAction() { owner.Flip(); }
+        }
+    }
+
+    // Un choix parmi quelques pastilles côte à côte : un clic, ou les flèches gauche et droite. La première pastille
+    // (« Non ») reste grise quand elle est choisie ; les autres prennent la couleur Accent.
+    class Choice : Control
+    {
+        readonly string[] items;
+        int selected, hover = -1;
+        Color accent = Slider.Fill;
+        public event EventHandler SelectedChanged; // seulement quand c'est vous qui choisissez
+
+        public Choice(params string[] items)
+        {
+            this.items = items;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            SetStyle(ControlStyles.StandardDoubleClick, false);
+            TabStop = true;
+            Cursor = Cursors.Hand;
+            AccessibleRole = AccessibleRole.Grouping;
+        }
+
+        public Color Accent { get { return accent; } set { accent = value; Invalidate(); } }
+
+        public int Selected
+        {
+            get { return selected; }
+            set
+            {
+                int v = Math.Max(0, Math.Min(items.Length - 1, value));
+                if (v == selected) return;
+                selected = v;
+                Invalidate();
+                AccessibilityNotifyClients(AccessibleEvents.Selection, v);
+            }
+        }
+
+        void Pick(int i)
+        {
+            i = Math.Max(0, Math.Min(items.Length - 1, i));
+            if (i == selected) return;
+            Selected = i;
+            if (SelectedChanged != null) SelectedChanged(this, EventArgs.Empty);
+        }
+
+        RectangleF Segment(int i)
+        {
+            float pad = Height / 10f, w = (Width - 2 * pad) / items.Length;
+            return new RectangleF(pad + i * w, pad, w, Height - 2 * pad);
+        }
+
+        int At(int x)
+        {
+            for (int i = 0; i < items.Length - 1; i++) if (x < Segment(i).Right) return i;
+            return items.Length - 1;
+        }
+
+        protected override void OnMouseClick(MouseEventArgs e)
+        {
+            base.OnMouseClick(e);
+            if (e.Button != MouseButtons.Left) return;
+            Focus();
+            Pick(At(e.X));
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            int h = At(e.X);
+            if (h != hover) { hover = h; Invalidate(); }
+        }
+
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hover = -1; Invalidate(); }
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+
+        protected override bool IsInputKey(Keys key)
+        {
+            return key == Keys.Left || key == Keys.Right || base.IsInputKey(key);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            if (e.KeyCode == Keys.Left) Pick(selected - 1);
+            else if (e.KeyCode == Keys.Right) Pick(selected + 1);
+            else if (e.KeyCode == Keys.Home) Pick(0);
+            else if (e.KeyCode == Keys.End) Pick(items.Length - 1);
+            else return;
+            e.Handled = true;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.Clear(BackColor);
+            float radius = Height / 5f, inner = radius - Height / 10f;
+            using (GraphicsPath path = Ui.Round(new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f), radius))
+            using (var brush = new SolidBrush(Ui.Button))
+                g.FillPath(brush, path);
+            for (int i = 0; i < items.Length; i++)
+            {
+                RectangleF r = Segment(i);
+                // Grisé (l'écran des consoles débranché) : ni couleur, ni survol.
+                Color back = i == selected ? (i == 0 || !Enabled ? Ui.Chosen : accent) : i == hover && Enabled ? Ui.Hover : Color.Empty;
+                if (!back.IsEmpty)
+                    using (GraphicsPath p = Ui.Round(r, inner))
+                    using (var b = new SolidBrush(back))
+                        g.FillPath(b, p);
+                Color fore = i != selected || !Enabled ? Ui.Dim : i == 0 ? Ui.Text : Color.Black;
+                TextRenderer.DrawText(g, items[i], Font, Rectangle.Round(r), fore, back.IsEmpty ? Ui.Button : back,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+            }
+            if (Focused && ShowFocusCues) Ui.FocusRing(g, RectangleF.Inflate(Segment(selected), -1.5f, -1.5f), inner);
+        }
+
+        // Pour un lecteur d'écran : un groupe de boutons radio.
+        protected override AccessibleObject CreateAccessibilityInstance() { return new Access(this); }
+
+        class Access : ControlAccessibleObject
+        {
+            readonly Choice owner;
+            public Access(Choice owner) : base(owner) { this.owner = owner; }
+            public override string Value { get { return owner.items[owner.selected]; } }
+            public override int GetChildCount() { return owner.items.Length; }
+            public override AccessibleObject GetChild(int index)
+            {
+                return index >= 0 && index < owner.items.Length ? new Item(owner, this, index) : null;
+            }
+        }
+
+        class Item : AccessibleObject
+        {
+            readonly Choice owner;
+            readonly AccessibleObject parent;
+            readonly int index;
+            public Item(Choice owner, AccessibleObject parent, int index) { this.owner = owner; this.parent = parent; this.index = index; }
+            public override string Name { get { return owner.items[index]; } }
+            public override AccessibleRole Role { get { return AccessibleRole.RadioButton; } }
+            public override AccessibleObject Parent { get { return parent; } }
+            public override Rectangle Bounds { get { return owner.RectangleToScreen(Rectangle.Round(owner.Segment(index))); } }
+            public override string DefaultAction { get { return "Choisir"; } }
+            public override void DoDefaultAction() { owner.Pick(index); }
+            public override AccessibleStates State
+            {
+                get
+                {
+                    AccessibleStates s = AccessibleStates.Selectable | AccessibleStates.Focusable;
+                    return index == owner.selected ? s | AccessibleStates.Checked | AccessibleStates.Selected : s;
+                }
+            }
+        }
+    }
+
+    // Un bouton arrondi, avec ou sans icône : un clic, Entrée ou Espace. Primary : le bouton principal d'une fenêtre,
+    // en couleur.
+    class RoundButton : Control
+    {
+        readonly string glyph;
+        bool hover, down;
+        public bool Primary;
+
+        public RoundButton(string glyph)
+        {
+            this.glyph = glyph;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            SetStyle(ControlStyles.StandardDoubleClick, false);
+            TabStop = true;
+            Cursor = Cursors.Hand;
+            AccessibleRole = AccessibleRole.PushButton;
+        }
+
+        protected override void OnTextChanged(EventArgs e) { base.OnTextChanged(e); Invalidate(); }
+        protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); Invalidate(); }
+        protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hover = true; Invalidate(); }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hover = down = false; Invalidate(); }
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button == MouseButtons.Left) { down = true; Invalidate(); }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            down = false;
+            Invalidate();
+        }
+
+        protected override bool IsInputKey(Keys key) { return key == Keys.Enter || base.IsInputKey(key); }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            if (e.KeyCode != Keys.Enter && e.KeyCode != Keys.Space) return;
+            e.Handled = true;
+            OnClick(EventArgs.Empty);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.Clear(BackColor);
+            float radius = Height / 7f;
+            var r = new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f);
+            bool live = Enabled && (hover || down);
+            Color back = Primary ? (!Enabled ? Ui.Button : down ? Color.FromArgb(64, 156, 204) : live ? Color.FromArgb(71, 177, 232) : Slider.Fill)
+                : down ? Ui.Pressed : live ? Ui.Hover : Ui.Button;
+            Color fore = !Enabled ? Ui.Dim : Primary ? Color.Black : Ui.Text;
+            using (GraphicsPath path = Ui.Round(r, radius))
+            {
+                using (var brush = new SolidBrush(back)) g.FillPath(brush, path);
+                if (!Primary || !Enabled) using (var pen = new Pen(Ui.Line)) g.DrawPath(pen, path);
+            }
+            const TextFormatFlags flags = TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine;
+            using (var icon = new Font(Ui.IconFont, Font.Size))
+            {
+                Size it = glyph.Length == 0 ? Size.Empty : TextRenderer.MeasureText(g, glyph, icon, Size.Empty, flags);
+                Size tt = TextRenderer.MeasureText(g, Text, Font, Size.Empty, flags);
+                int gap = glyph.Length == 0 ? 0 : Font.Height / 2, x = (Width - it.Width - gap - tt.Width) / 2;
+                if (glyph.Length > 0) TextRenderer.DrawText(g, glyph, icon, new Rectangle(x, 0, it.Width, Height), fore, back, flags);
+                TextRenderer.DrawText(g, Text, Font, new Rectangle(x + it.Width + gap, 0, tt.Width + 2, Height), fore, back, flags);
+            }
+            if (Focused && ShowFocusCues) Ui.FocusRing(g, RectangleF.Inflate(r, -2.5f, -2.5f), radius - 2);
+        }
+    }
+
+    // Le panneau qui s'ouvre d'un clic sur l'icône, près de l'heure : la luminosité (un curseur par écran, de gauche à
+    // droite), le filtre de la lumière bleue, « Lier les écrans » et l'extinction, chaque partie dans une carte.
+    // À la Windows 11, en sombre, avec un fondu à l'ouverture. Les mesures sont en pixels à 96 ppp ; S() les met à
+    // l'échelle de l'écran.
     class BrightnessPanel : Form
     {
         const string LinkValue = "LierLuminosite";
-        static readonly Color Back = Color.FromArgb(32, 32, 32);
-        static readonly Color Dim = Color.FromArgb(170, 170, 170);
+        const int W = 360, Edge = 10, Pad = 22; // la largeur ; le bord des cartes ; le bord de ce qu'elles contiennent
+        const int Inner = W - 2 * Pad;
         readonly Brightness light;
         readonly Dimmer dimmer;
+        readonly float scale;
         readonly List<Slider> sliders = new List<Slider>();
         readonly List<Label> values = new List<Label>();
         readonly List<string> devices = new List<string>();
-        readonly CheckBox link = new CheckBox();
-        readonly Label status = new Label();
-        string readStatus = "Lecture des écrans…";
+        readonly Toggle link = new Toggle();
+        readonly ToolTip tips = new ToolTip();
+        readonly Choice filter = new Choice("Non", "Sous le min", "Toujours");
+        readonly Slider warmth = new Slider();
+        readonly Label warmthValue = new Label();
+        readonly Timer fade = new Timer { Interval = 15 };
+        readonly Timer previewEnd = new Timer { Interval = 1200 };
+        readonly List<Rectangle> cards = new List<Rectangle>(); // en pixels de l'écran
+        Color surface = Ui.Back; // le fond derrière les contrôles qu'on pose
+        int y, cardTop;          // en pixels à 96 ppp
+        int targetTop, fadeStep;
+        bool roundedByWindows;
 
-        public BrightnessPanel(Brightness light, Dimmer dimmer, string offText, Action turnOff)
+        // pick(écran, console) : passer cet écran sur la console, ou sur le PC si console vaut null.
+        public BrightnessPanel(Brightness light, Dimmer dimmer, string offText, Action turnOff,
+            List<ConsoleInput> consoles, ConsoleInput playing, Action<string, ConsoleInput> pick)
         {
             this.light = light;
             this.dimmer = dimmer;
@@ -1606,65 +2778,176 @@ namespace Eclipse
             TopMost = true;
             KeyPreview = true;
             StartPosition = FormStartPosition.Manual;
-            BackColor = Back;
-            ForeColor = Color.White;
-            Font = new Font("Segoe UI", 10f);
-            AutoScaleDimensions = new SizeF(96f, 96f);
-            AutoScaleMode = AutoScaleMode.Dpi;
+            AutoScaleMode = AutoScaleMode.None;
+            DoubleBuffered = true;
+            BackColor = Ui.Back;
+            ForeColor = Ui.Text;
+            Font = new Font(Ui.TextFont, 10f);
+            Opacity = 0; // le fondu à l'ouverture
+            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) scale = g.DpiX / 96f;
 
             var screensNow = new List<Screen>(Screen.AllScreens);
             screensNow.Sort((a, b) => a.Bounds.X != b.Bounds.X ? a.Bounds.X.CompareTo(b.Bounds.X) : a.Bounds.Y.CompareTo(b.Bounds.Y));
-            int y = 14;
-            var title = new Label { Text = "Luminosité", Font = new Font("Segoe UI Semibold", 11f), AutoSize = false };
-            title.SetBounds(16, y, 300, 24);
-            Controls.Add(title);
-            y += 34;
+            y = 14;
+            Heading(Ui.Sun, "Luminosité");
+            BeginCard();
             for (int i = 0; i < screensNow.Count; i++)
             {
                 Screen sc = screensNow[i];
-                string where = screensNow.Count == 1 ? string.Empty
-                    : i == 0 ? "à gauche" : i == screensNow.Count - 1 ? "à droite" : "au milieu";
-                if (sc.Primary) where = where.Length == 0 ? "principal" : where + ", principal";
+                string where = Ui.Place(i, screensNow.Count, sc.Primary);
                 string name = light.NameOf(sc.DeviceName) ?? ("Écran " + (i + 1));
-                var label = new Label { Text = name + (where.Length > 0 ? "  ·  " + where : string.Empty), AutoSize = false };
-                label.SetBounds(16, y, 300, 22);
-                Controls.Add(label);
-                var slider = new Slider { Enabled = false, Minimum = -Dimmer.Max };
-                slider.SetBounds(12, y + 24, 262, 42);
-                var value = new Label { Text = "…", TextAlign = ContentAlignment.MiddleRight, ForeColor = Dim, AutoSize = false };
-                value.SetBounds(270, y + 26, 56, 26);
-                string device = sc.DeviceName;
+                Add(new Label { Text = name + (where.Length > 0 ? "  ·  " + where : string.Empty), AutoSize = false, AutoEllipsis = true, UseMnemonic = false },
+                    Pad, y, Inner - 64, 22);
+                var value = new Label { Text = "…", TextAlign = ContentAlignment.MiddleRight, ForeColor = Ui.Dim, AutoSize = false };
+                Add(value, W - Pad - 64, y, 64, 22);
+                var slider = new Slider { Enabled = false, Minimum = -Dimmer.Max, AccessibleName = "Luminosité de " + name };
+                Add(slider, Pad - 6, y + 24, Inner + 12, 42);
                 int index = i;
                 slider.ValueChanged += delegate { OnSlide(index); };
-                Controls.Add(slider);
-                Controls.Add(value);
                 sliders.Add(slider);
                 values.Add(value);
-                devices.Add(device);
-                y += 74;
+                devices.Add(sc.DeviceName);
+                y += 70;
             }
-            status.Text = readStatus;
-            status.ForeColor = Dim;
-            status.Font = new Font("Segoe UI", 9f);
-            status.AutoSize = false;
-            status.SetBounds(16, y - 6, 308, 40);
-            Controls.Add(status);
-            y += 38;
-            link.Text = "Lier les écrans";
-            link.Checked = LoadLink();
-            link.SetBounds(16, y, 180, 26);
-            link.CheckedChanged += delegate { SaveLink(link.Checked); };
-            Controls.Add(link);
-            var off = new Button { Text = offText, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(55, 55, 55), ForeColor = Color.White };
-            off.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80);
-            off.SetBounds(16, y + 36, 308, 34);
+            EndCard();
+
+            Heading(Ui.Moon, "Lumière bleue");
+            BeginCard();
+            filter.Accent = Ui.Warm;
+            filter.AccessibleName = "Filtre de la lumière bleue";
+            filter.AccessibleDescription = "Moins de bleu : une image plus chaude, sur tous les écrans à la fois.\n"
+                + "Sans effet sur les consoles ni sur les jeux en plein écran exclusif.\n"
+                + "S'ajoute à l'éclairage nocturne de Windows, s'il est allumé.";
+            tips.SetToolTip(filter, filter.AccessibleDescription);
+            filter.SelectedChanged += delegate { dimmer.SetMode((BlueFilter)filter.Selected); ShowFilter(); };
+            Add(filter, Pad, y, Inner, 32);
+            y += 42;
+            Add(new Label { Text = "Chaleur", ForeColor = Ui.Dim, AutoSize = false }, Pad, y, 120, 22);
+            warmthValue.TextAlign = ContentAlignment.MiddleRight;
+            warmthValue.ForeColor = Ui.Dim;
+            warmthValue.AutoSize = false;
+            Add(warmthValue, W - Pad - 64, y, 64, 22);
+            warmth.Accent = Ui.Warm;
+            warmth.AccessibleName = "Chaleur du filtre";
+            warmth.ValueChanged += delegate { OnWarmth(); };
+            Add(warmth, Pad - 6, y + 22, Inner + 12, 28);
+            y += 54;
+            EndCard();
+
+            if (screensNow.Count >= 2)
+            {
+                BeginCard();
+                var linkLabel = new Label { Text = "Lier les écrans", AutoSize = false, TextAlign = ContentAlignment.MiddleLeft, Cursor = Cursors.Hand };
+                linkLabel.Click += delegate { link.Focus(); link.Flip(); };
+                Add(linkLabel, Pad, y, Inner - 56, 30);
+                link.Checked = LoadLink();
+                link.AccessibleName = "Lier les écrans";
+                link.CheckedChanged += delegate { SaveLink(link.Checked); };
+                Add(link, W - Pad - 48, y, 48, 30);
+                y += 30;
+                EndCard();
+            }
+            if (consoles.Count > 0) AddConsoles(consoles, playing, pick);
+            y += 4;
+            var off = new RoundButton(Ui.Power) { Text = offText };
             off.Click += delegate { Close(); turnOff(); };
-            Controls.Add(off);
-            ClientSize = new Size(340, y + 84);
-            if (screensNow.Count < 2) link.Visible = false;
+            surface = Ui.Back;
+            Add(off, Edge, y, W - 2 * Edge, 36);
+            y += 36 + 16;
+            ClientSize = new Size(S(W), S(y));
+            ShowFilter();
 
             KeyDown += (s, e) => { if (e.KeyCode == Keys.Escape) Close(); };
             Deactivate += delegate { Close(); };
+            fade.Tick += delegate { FadeStep(); };
+            previewEnd.Tick += delegate { previewEnd.Stop(); dimmer.Preview(false); };
+            FormClosed += delegate
+            {
+                fade.Stop();
+                previewEnd.Stop();
+                dimmer.Preview(false);
+                dimmer.Save();
+            };
+        }
+
+        int S(int v) { return (int)Math.Round(v * scale); }
+
+        void Add(Control c, int x, int top, int w, int h)
+        {
+            c.SetBounds(S(x), S(top), S(w), S(h));
+            c.BackColor = surface;
+            Controls.Add(c);
+        }
+
+        // Les consoles : pour chaque écran qui en a, « PC » et ses consoles en pastilles ; celle à l'écran est choisie.
+        // Un choix ferme le panneau, puis l'écran change.
+        void AddConsoles(List<ConsoleInput> consoles, ConsoleInput playing, Action<string, ConsoleInput> pick)
+        {
+            Heading(Ui.Game, "Consoles");
+            BeginCard();
+            var screens = new List<string>();
+            foreach (ConsoleInput c in consoles)
+                if (!screens.Exists(s => string.Equals(s, c.Screen, StringComparison.OrdinalIgnoreCase))) screens.Add(c.Screen);
+            foreach (string screen in screens)
+            {
+                string id = screen;
+                List<ConsoleInput> group = consoles.FindAll(c => string.Equals(c.Screen, id, StringComparison.OrdinalIgnoreCase));
+                string device = PrimaryScreen.DeviceOf(id);
+                string name = device == null ? null : light.NameOf(device);
+                if (screens.Count > 1)
+                {
+                    Add(new Label { Text = name ?? "Écran débranché", AutoSize = false, AutoEllipsis = true, UseMnemonic = false }, Pad, y, Inner, 22);
+                    y += 26;
+                }
+                var names = new List<string> { "PC" };
+                var keys = new StringBuilder();
+                foreach (ConsoleInput c in group)
+                {
+                    names.Add(c.Name);
+                    if (c.WorkingShortcut != null) keys.Append(c.WorkingShortcut + " : " + c.Name + "\n");
+                }
+                var choice = new Choice(names.ToArray());
+                choice.AccessibleName = "Ce que montre l'écran " + (name ?? string.Empty);
+                choice.AccessibleDescription = keys + "Le même raccourci ramène l'écran sur le PC.";
+                tips.SetToolTip(choice, choice.AccessibleDescription);
+                choice.Selected = group.IndexOf(playing) + 1; // 0, « PC », si aucune console de cet écran n'est à l'écran
+                choice.Enabled = device != null;
+                choice.SelectedChanged += delegate
+                {
+                    int k = choice.Selected;
+                    Close();
+                    pick(id, k == 0 ? null : group[k - 1]);
+                };
+                Add(choice, Pad, y, Inner, 32);
+                y += 42;
+            }
+            y -= 10;
+            EndCard();
+        }
+
+        void Heading(string glyph, string text)
+        {
+            Add(new Label { Text = glyph, Font = new Font(Ui.IconFont, 11f), AutoSize = false, TextAlign = ContentAlignment.MiddleLeft, UseMnemonic = false },
+                Edge, y, 24, 24);
+            Add(new Label { Text = text, Font = new Font(Ui.StrongFont, 10.5f), AutoSize = false, TextAlign = ContentAlignment.MiddleLeft },
+                Edge + 26, y, W - 2 * Edge - 26, 24);
+            y += 32;
+        }
+
+        // Une carte : un fond plus clair, arrondi, dessiné par OnPaint derrière ce qu'on pose entre BeginCard et EndCard.
+        void BeginCard()
+        {
+            cardTop = y;
+            y += 12;
+            surface = Ui.Card;
+        }
+
+        void EndCard()
+        {
+            y += 8;
+            cards.Add(new Rectangle(S(Edge), S(cardTop), S(W - 2 * Edge), S(y - cardTop)));
+            y += 12;
+            surface = Ui.Back;
         }
 
         protected override CreateParams CreateParams
@@ -1681,16 +2964,49 @@ namespace Eclipse
         protected override void OnLoad(EventArgs e)
         {
             base.OnLoad(e);
-            try { int round = 2; Ddc.DwmSetWindowAttribute(Handle, 33, ref round, 4); } catch { } // coins arrondis (Windows 11)
+            try
+            {
+                int round = 2; // coins arrondis : Windows 11 seulement ; sous Windows 10, le cadre est dessiné par OnPaint
+                roundedByWindows = Ddc.DwmSetWindowAttribute(Handle, 33, ref round, 4) == 0;
+                int border = ColorTranslator.ToWin32(Ui.Line);
+                if (roundedByWindows) Ddc.DwmSetWindowAttribute(Handle, 34, ref border, 4);
+            }
+            catch (DllNotFoundException) { }
+            catch (EntryPointNotFoundException) { }
             Rectangle work = Screen.FromPoint(Cursor.Position).WorkingArea;
-            int gap = (int)Math.Round(12 * DeviceScale());
-            Location = new Point(work.Right - Width - gap, work.Bottom - Height - gap);
+            int gap = S(12);
+            targetTop = work.Bottom - Height - gap;
+            Location = new Point(work.Right - Width - gap, targetTop + S(8));
+            fade.Start();
             light.Refresh(Fill);
         }
 
-        float DeviceScale()
+        // Le fondu : 8 pas d'environ 15 ms, qui finissent en douceur, en montant de 8 pixels.
+        void FadeStep()
         {
-            using (Graphics g = CreateGraphics()) return g.DpiX / 96f;
+            fadeStep++;
+            double t = Math.Min(1, fadeStep / 8.0), ease = 1 - Math.Pow(1 - t, 3);
+            Opacity = ease;
+            Top = targetTop + (int)Math.Round(S(8) * (1 - ease));
+            if (t < 1) return;
+            fade.Stop();
+            Opacity = 1;
+            Top = targetTop;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var brush = new SolidBrush(Ui.Card))
+                foreach (Rectangle c in cards)
+                    using (GraphicsPath path = Ui.Round(c, S(8)))
+                        g.FillPath(brush, path);
+            if (roundedByWindows) return;
+            g.SmoothingMode = SmoothingMode.None;
+            using (var pen = new Pen(Ui.Line))
+                g.DrawRectangle(pen, 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
         }
 
         // Sur le fil de la luminosité : les valeurs lues, rendues au fil du panneau.
@@ -1703,41 +3019,23 @@ namespace Eclipse
         void ShowValues(List<ScreenLight> read)
         {
             if (IsDisposed) return;
-            int ok = 0;
             for (int i = 0; i < devices.Count; i++)
             {
                 ScreenLight s = read.Find(x => string.Equals(x.Device, devices[i], StringComparison.OrdinalIgnoreCase));
                 bool usable = s != null && s.Ok;
                 sliders[i].Enabled = usable;
-                if (usable) { Put(i, dimmer.Level > 0 ? -dimmer.Level : s.Percent); ok++; }
+                sliders[i].Message = usable ? null : "Ne répond pas : activez DDC/CI dans son menu.";
+                if (usable) ShowValue(i, dimmer.Level > 0 ? -dimmer.Level : s.Percent);
                 else values[i].Text = "—";
             }
-            readStatus = ok == devices.Count ? string.Empty
-                : ok == 0 ? "Aucun écran ne répond. Activez DDC/CI dans le menu de vos écrans."
-                : "Un écran ne répond pas : activez DDC/CI dans son menu.";
-            UpdateStatus();
         }
 
         // Une valeur sur le curseur et dans le texte : « 40 % », ou en orange « −30 % » sous le minimum.
-        void Put(int i, int v)
+        void ShowValue(int i, int v)
         {
             sliders[i].Value = v;
             values[i].Text = v < 0 ? "−" + (-v) + " %" : v + " %";
-            values[i].ForeColor = v < 0 ? Slider.Below : Dim;
-        }
-
-        void UpdateStatus()
-        {
-            if (dimmer.Level > 0)
-            {
-                status.ForeColor = Slider.Below;
-                status.Text = "Sous le minimum de l'écran : l'image est assombrie de " + dimmer.Level + " %, sur tous les écrans.";
-            }
-            else
-            {
-                status.ForeColor = Dim;
-                status.Text = readStatus;
-            }
+            values[i].ForeColor = v < 0 ? Slider.Below : Ui.Dim;
         }
 
         // Au-dessus du seuil, la vraie luminosité de chaque écran. En dessous, les écrans restent à leur minimum et l'image
@@ -1750,11 +3048,10 @@ namespace Eclipse
                 for (int i = 0; i < sliders.Count; i++)
                 {
                     if (!sliders[i].Enabled) continue;
-                    Put(i, v);
+                    ShowValue(i, v);
                     light.Set(devices[i], 0);
                 }
                 dimmer.Set(-v);
-                UpdateStatus();
                 return;
             }
             bool wasDim = dimmer.Level > 0;
@@ -1764,10 +3061,29 @@ namespace Eclipse
                 if (!sliders[i].Enabled) continue;
                 bool follow = i == index || link.Checked;
                 if (!follow && !wasDim) continue;
-                Put(i, follow ? v : 0); // non liés : remontés au seuil, là où ils étaient vraiment
+                ShowValue(i, follow ? v : 0); // non liés : remontés au seuil, là où ils étaient vraiment
                 light.Set(devices[i], follow ? v : 0);
             }
-            UpdateStatus();
+        }
+
+        // Le filtre tel qu'il est réglé ; aussi appelé quand Ctrl+Alt+Maj+B le change, panneau ouvert.
+        public void ShowFilter()
+        {
+            filter.Selected = (int)dimmer.Mode;
+            warmth.Value = dimmer.Chaleur;
+            warmth.Enabled = dimmer.Mode != BlueFilter.Non;
+            warmthValue.Text = dimmer.Chaleur + " %";
+        }
+
+        // La chaleur se voit pendant qu'on la règle, même si le filtre attend d'être sous le minimum.
+        void OnWarmth()
+        {
+            dimmer.SetChaleur(warmth.Value);
+            warmthValue.Text = warmth.Value + " %";
+            if (dimmer.Mode != BlueFilter.SousLeMin) return;
+            dimmer.Preview(true);
+            previewEnd.Stop();
+            previewEnd.Start();
         }
 
         static bool LoadLink()
@@ -1785,13 +3101,22 @@ namespace Eclipse
             try { using (RegistryKey key = Registry.CurrentUser.CreateSubKey(@"Software\Eclipse")) key.SetValue(LinkValue, on ? 1 : 0); }
             catch (Exception e) { Journal.Write("Luminosité : réglage « Lier » non enregistré (" + e.Message + ")."); }
         }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) { fade.Dispose(); previewEnd.Dispose(); tips.Dispose(); }
+            base.Dispose(disposing);
+        }
     }
 
-    // Le rappel en bas de l'écran après Ctrl+Alt+Maj+Haut / Bas : « Luminosité 60 % », 1,5 s, sans prendre le clavier.
+    // Le rappel en bas de l'écran, 1,5 s, sans prendre le clavier : « Luminosité 60 % » après Ctrl+Alt+Maj+Haut / Bas,
+    // l'état du filtre après Ctrl+Alt+Maj+B, ou un message des consoles (3 s).
     class LightOsd : Form
     {
         readonly Timer hide = new Timer { Interval = 1500 };
         int percent;
+        string filterText; // le rappel du filtre ; null pour celui de la luminosité
+        string message;    // un message des consoles, sur une ligne
 
         public LightOsd()
         {
@@ -1799,9 +3124,9 @@ namespace Eclipse
             ShowInTaskbar = false;
             TopMost = true;
             StartPosition = FormStartPosition.Manual;
-            BackColor = Color.FromArgb(32, 32, 32);
-            ForeColor = Color.White;
-            Font = new Font("Segoe UI", 10f);
+            BackColor = Ui.Back;
+            ForeColor = Ui.Text;
+            Font = new Font(Ui.TextFont, 10f);
             SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint, true);
             hide.Tick += delegate { hide.Stop(); Hide(); };
         }
@@ -1821,16 +3146,67 @@ namespace Eclipse
 
         public void Flash(int value)
         {
+            filterText = message = null;
             percent = value;
+            Pop(300, null, 1500);
+        }
+
+        public void FlashFilter(BlueFilter mode, int chaleur)
+        {
+            message = null;
+            filterText = mode == BlueFilter.Toujours ? "Lumière bleue filtrée  " + chaleur + " %"
+                : mode == BlueFilter.SousLeMin ? "Lumière bleue : filtrée sous le minimum"
+                : "Lumière bleue : filtre arrêté";
+            percent = mode == BlueFilter.Toujours ? chaleur : -1;
+            Pop(300, null, 1500);
+        }
+
+        // Un message des consoles, 3 s, jamais sur l'écran notOn (\\.\DISPLAY1), celui qui montre la console.
+        public void FlashMessage(string text, string notOn)
+        {
+            filterText = null;
+            message = text;
+            Pop(0, notOn, 3000);
+        }
+
+        // width : en pixels à 96 ppp ; 0 pour la largeur du message.
+        void Pop(int width, string notOn, int ms)
+        {
             float scale;
-            using (Graphics g = CreateGraphics()) scale = g.DpiX / 96f;
-            Size = new Size((int)(300 * scale), (int)(64 * scale));
-            Rectangle work = Screen.FromPoint(Cursor.Position).WorkingArea;
+            int textWidth = 0;
+            using (Graphics g = CreateGraphics())
+            {
+                scale = g.DpiX / 96f;
+                if (message != null) textWidth = TextRenderer.MeasureText(g, message, Font).Width;
+            }
+            Rectangle work = WorkArea(notOn);
+            int w = width > 0 ? (int)(width * scale) : textWidth + (int)(68 * scale);
+            Size = new Size(Math.Min(w, work.Width - (int)(32 * scale)), (int)(64 * scale));
             Location = new Point(work.Left + (work.Width - Width) / 2, work.Bottom - Height - (int)(48 * scale));
             if (!Visible) { Show(); try { int round = 2; Ddc.DwmSetWindowAttribute(Handle, 33, ref round, 4); } catch { } }
             Invalidate();
             hide.Stop();
+            hide.Interval = ms;
             hide.Start();
+        }
+
+        // La zone de l'écran de la souris ; si c'est notOn, celle de l'écran principal, ou d'un autre. Lue à l'instant :
+        // juste après un changement d'écran principal, Screen.AllScreens n'est pas encore à jour.
+        static Rectangle WorkArea(string notOn)
+        {
+            List<Ddc.MONITORINFOEX> all = Ddc.Monitors();
+            Point p = Cursor.Position;
+            int pick = -1;
+            for (int i = 0; i < all.Count; i++)
+            {
+                if (notOn != null && string.Equals(all[i].Device, notOn, StringComparison.OrdinalIgnoreCase)) continue;
+                Ddc.RECT r = all[i].Monitor;
+                if (p.X >= r.Left && p.X < r.Right && p.Y >= r.Top && p.Y < r.Bottom) { pick = i; break; }
+                if (pick < 0 || (all[i].Flags & 1) != 0) pick = i;
+            }
+            if (pick < 0) return Screen.FromPoint(p).WorkingArea;
+            Ddc.RECT w = all[pick].Work;
+            return Rectangle.FromLTRB(w.Left, w.Top, w.Right, w.Bottom);
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -1839,14 +3215,33 @@ namespace Eclipse
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.Clear(BackColor);
             float s = Height / 64f;
+            if (message != null)
+            {
+                using (var icon = new Font(Ui.IconFont, 13f))
+                    TextRenderer.DrawText(g, Ui.Game, icon, new Rectangle((int)(16 * s), 0, (int)(28 * s), Height), Slider.Fill, BackColor,
+                        TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                TextRenderer.DrawText(g, message, Font, new Rectangle((int)(52 * s), 0, Width - (int)(60 * s), Height), ForeColor, BackColor,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+                return;
+            }
+            var bar = new RectangleF(16 * s, 30 * s, Width - 32 * s, 14 * s);
+            if (filterText != null)
+            {
+                bool on = percent >= 0;
+                float top = on ? 8 * s : (Height - Font.GetHeight(g)) / 2;
+                using (var brush = new SolidBrush(on ? Ui.Warm : ForeColor))
+                    g.DrawString(filterText, Font, brush, 16 * s, top);
+                if (on) Slider.PaintBar(g, bar, 0, percent, 4 * s, true, null, false, Ui.Warm);
+                return;
+            }
             string text = percent == NoScreen ? "Luminosité : aucun écran ne répond"
                 : percent < 0 ? "Sous le minimum  −" + (-percent) + " %"
                 : "Luminosité  " + percent + " %";
             using (var brush = new SolidBrush(percent < 0 && percent != NoScreen ? Slider.Below : ForeColor))
                 g.DrawString(text, Font, brush, 16 * s, 8 * s);
             if (percent == NoScreen) return;
-            using (var small = new Font("Segoe UI", 7.5f))
-                Slider.PaintBar(g, new RectangleF(16 * s, 30 * s, Width - 32 * s, 14 * s), -Dimmer.Max, percent, 4 * s, true, small, true);
+            using (var small = new Font(Ui.TextFont, 7.5f))
+                Slider.PaintBar(g, bar, -Dimmer.Max, percent, 4 * s, true, small, true, Slider.Fill);
         }
 
         public const int NoScreen = int.MinValue;
@@ -1922,23 +3317,34 @@ namespace Eclipse
         }
     }
 
-    // ---- Le choix du raccourci ----
+    // ---- Le choix d'un raccourci ----
 
+    // Demander une combinaison à la personne ; false si elle renonce. refusal : pourquoi une combinaison ne peut pas
+    // servir, ou null.
+    delegate bool CaptureKeys(IWin32Window owner, string title, Func<uint, uint, string> refusal, out uint mods, out uint key);
+
+    // La fenêtre où l'on fait sa combinaison. Une combinaison refusée affiche sa raison, et on en fait une autre ;
+    // Échap ou la croix : rien ne change. En sombre, comme le panneau.
     class HotkeyDialog : Form
     {
+        const string Ask = "Faites votre combinaison : au moins deux touches parmi Ctrl, Alt et Maj, plus une autre touche. Échap : annuler.";
+        readonly Label label = new Label { Text = Ask, UseMnemonic = false };
+        readonly Func<uint, uint, string> refusal;
         public uint Mods, Key;
 
-        public HotkeyDialog()
+        public HotkeyDialog(string title, Func<uint, uint, string> refusal)
         {
-            Text = "Changer le raccourci";
+            this.refusal = refusal;
+            Text = title;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MinimizeBox = MaximizeBox = false;
             TopMost = true;
             KeyPreview = true;
             StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new Size(420, 100);
-            Font = new Font("Segoe UI", 10f);
-            var label = new Label { Text = "Faites votre combinaison : au moins deux touches parmi Ctrl, Alt et Maj, plus une autre touche." };
+            BackColor = Ui.Back;
+            ForeColor = Ui.Text;
+            Font = new Font(Ui.TextFont, 10f);
             label.SetBounds(16, 16, 388, 68);
             Controls.Add(label);
             AutoScaleDimensions = new SizeF(96f, 96f);
@@ -1946,10 +3352,17 @@ namespace Eclipse
             KeyDown += OnCapture;
         }
 
+        protected override void OnLoad(EventArgs e)
+        {
+            base.OnLoad(e);
+            Ui.DarkTitle(Handle);
+        }
+
         void OnCapture(object sender, KeyEventArgs e)
         {
             e.SuppressKeyPress = e.Handled = true;
             Keys key = e.KeyCode;
+            if (key == Keys.Escape && e.Modifiers == Keys.None) { DialogResult = DialogResult.Cancel; return; }
             if (key == Keys.ControlKey || key == Keys.Menu || key == Keys.ShiftKey || key == Keys.LWin || key == Keys.RWin) return;
             if (key == Keys.Delete) return; // Ctrl+Alt+Suppr appartient à Windows
             uint mods = 0;
@@ -1958,9 +3371,338 @@ namespace Eclipse
             if (e.Alt) { mods |= Native.MOD_ALT; count++; }
             if (e.Shift) { mods |= Native.MOD_SHIFT; count++; }
             if (count < 2) return;
+            string why = refusal == null ? null : refusal(mods, (uint)key);
+            if (why != null) { label.Text = why + " Faites une autre combinaison, ou Échap pour annuler."; return; }
             Mods = mods;
             Key = (uint)key;
             DialogResult = DialogResult.OK;
+        }
+    }
+
+    // ---- Le questionnaire des consoles ----
+
+    // Les prises de chaque écran qui change d'entrée sur ordre du PC : on nomme ce qui y est branché (« Xbox »), et chaque
+    // nom reçoit un raccourci, qu'un clic change. « Voir » passe l'écran sur la prise 8 s, puis le ramène sur le PC.
+    // L'entrée qu'un écran affiche à l'ouverture est celle du PC : le questionnaire ne s'ouvre pas pendant le jeu. Mêmes
+    // couleurs que le panneau ; mesures en pixels à 96 ppp, mises à l'échelle par S().
+    class ConsoleDialog : Form
+    {
+        const int W = 590, Edge = 10, Pad = 22, Inner = W - 2 * Pad, Seconds = 8;
+        readonly Brightness light;
+        readonly List<ConsoleInput> before;
+        readonly List<ConsoleInput> kept = new List<ConsoleInput>(); // celles d'un écran absent ou muet : gardées telles quelles
+        readonly List<uint> reserved = new List<uint>(); // les touches refusées avec Ctrl+Alt+Maj (le raccourci principal…)
+        readonly Func<uint, uint, string> refusal;
+        readonly CaptureKeys capture;
+        readonly float scale;
+        readonly List<Row> rows = new List<Row>();
+        readonly List<Rectangle> cards = new List<Rectangle>();
+        readonly Timer seeTimer = new Timer { Interval = 1000 };
+        readonly ToolTip tips = new ToolTip();
+        readonly Label reading = new Label { Text = "Lecture des écrans (quelques secondes)…", ForeColor = Ui.Dim, AutoSize = false };
+        readonly RoundButton save = new RoundButton(string.Empty) { Text = "Enregistrer", Primary = true, Enabled = false };
+        readonly RoundButton cancel = new RoundButton(string.Empty) { Text = "Annuler" };
+        Color surface = Ui.Back;
+        int y, cardTop, top, seeLeft;
+        Row seeing;
+
+        // Les consoles nommées, avec leur raccourci ; null si on a annulé.
+        public List<ConsoleInput> Result { get; private set; }
+
+        class Row
+        {
+            public ConsoleInput Entry; // la prise, son nom tapé et son raccourci
+            public string Where;       // « HDMI 1, Écran 1 », pour le lecteur d'écran
+            public TextBox Name;
+            public RoundButton Key, See;
+        }
+
+        // refusal : pourquoi une combinaison ne peut pas servir (elle sert déjà dans Eclipse…), ou null ; capture : demander
+        // une combinaison à la personne. Sans eux (images de la documentation), les raccourcis ne se changent pas.
+        public ConsoleDialog(Brightness light, List<ConsoleInput> before, Func<uint, uint, string> refusal, CaptureKeys capture)
+        {
+            this.light = light;
+            this.before = before;
+            this.refusal = refusal;
+            this.capture = capture;
+            if (refusal != null) // les lettres automatiques évitent les combinaisons refusées
+                for (uint k = '0'; k <= 'Z'; k++)
+                    if ((k <= '9' || k >= 'A') && refusal(Hotkeys.Cas, k) != null) reserved.Add(k);
+            Text = "Eclipse : consoles";
+            FormBorderStyle = FormBorderStyle.FixedSingle;
+            MaximizeBox = MinimizeBox = false;
+            StartPosition = FormStartPosition.Manual;
+            AutoScaleMode = AutoScaleMode.None;
+            KeyPreview = true;
+            DoubleBuffered = true;
+            BackColor = Ui.Back;
+            ForeColor = Ui.Text;
+            Font = new Font(Ui.TextFont, 10f);
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) scale = g.DpiX / 96f;
+
+            y = 14;
+            Add(new Label { Text = Ui.Game, Font = new Font(Ui.IconFont, 11f), AutoSize = false, TextAlign = ContentAlignment.MiddleLeft, UseMnemonic = false },
+                Edge, y, 24, 24);
+            Add(new Label { Text = "Consoles au clavier", Font = new Font(Ui.StrongFont, 10.5f), AutoSize = false, TextAlign = ContentAlignment.MiddleLeft },
+                Edge + 26, y, W - 2 * Edge - 26, 24);
+            y += 32;
+            Add(new Label { Text = "Nommez ce qui est branché sur chaque prise : une console, un autre PC… "
+                + "Chaque nom reçoit un raccourci. Il passe l'écran sur la prise, puis le ramène sur le PC. "
+                + "Cliquez sur un raccourci pour le changer.",
+                ForeColor = Ui.Dim, AutoSize = false, UseMnemonic = false }, Edge, y, W - 2 * Edge, 64);
+            y += 72;
+            top = y;
+            Add(reading, Pad, y, Inner, 24);
+            y += 40;
+            Add(cancel, W - Pad - 2 * 120 - 8, y, 120, 34);
+            Add(save, W - Pad - 120, y, 120, 34);
+            ClientSize = new Size(S(W), S(y + 34 + 16));
+
+            seeTimer.Tick += delegate { SeeTick(); };
+            save.Click += delegate { Save(); };
+            cancel.Click += delegate { Close(); };
+            KeyDown += OnKey;
+            FormClosing += delegate { Back(); };
+        }
+
+        int S(int v) { return (int)Math.Round(v * scale); }
+
+        void Add(Control c, int x, int at, int w, int h)
+        {
+            c.SetBounds(S(x), S(at), S(w), S(h));
+            c.BackColor = surface;
+            Controls.Add(c);
+        }
+
+        protected override void OnLoad(EventArgs e)
+        {
+            base.OnLoad(e);
+            Ui.DarkTitle(Handle);
+            Center();
+            light.ReadInputs(read =>
+            {
+                if (IsDisposed || !IsHandleCreated) return;
+                try { BeginInvoke(new Action(delegate { Fill(read); })); } catch (InvalidOperationException) { }
+            });
+        }
+
+        void Center()
+        {
+            Rectangle work = Screen.FromPoint(Cursor.Position).WorkingArea;
+            Location = new Point(work.Left + (work.Width - Width) / 2, work.Top + Math.Max(0, (work.Height - Height) / 2));
+        }
+
+        // Les écrans lus : une carte par écran, une ligne par prise.
+        void Fill(List<ScreenLight> read)
+        {
+            if (IsDisposed) return;
+            SuspendLayout();
+            Controls.Remove(reading);
+            reading.Dispose();
+            y = top;
+            List<string> ids = read.ConvertAll(s => s.Id);
+            var shown = new List<int>(); // les écrans qui ont des lignes
+            for (int i = 0; i < read.Count; i++)
+            {
+                ScreenLight s = read[i];
+                string where = Ui.Place(i, read.Count, s.Bounds.X == 0 && s.Bounds.Y == 0);
+                BeginCard();
+                Add(new Label { Text = s.Name + (where.Length > 0 ? "  ·  " + where : string.Empty), Font = new Font(Ui.StrongFont, 10f),
+                    AutoSize = false, AutoEllipsis = true, UseMnemonic = false }, Pad, y, Inner, 24);
+                y += 30;
+                int[] offered = Inputs.Offered(s.Inputs);
+                string why = !s.Ok ? "Ne répond pas : activez DDC/CI dans son menu."
+                    : offered == null ? "Ne change pas d'entrée sur ordre du PC."
+                    : s.Input < 0 ? "Son entrée actuelle ne se lit pas : réessayez dans un moment."
+                    : Array.TrueForAll(offered, code => code == s.Input) ? "Une seule entrée : rien à régler."
+                    : null;
+                if (why != null)
+                {
+                    Add(new Label { Text = why, ForeColor = Ui.Dim, AutoSize = false, UseMnemonic = false }, Pad, y, Inner, 22);
+                    y += 22;
+                    EndCard();
+                    continue;
+                }
+                shown.Add(i);
+                Add(new Label { Text = Inputs.NameOf(s.Input), AutoSize = false, TextAlign = ContentAlignment.MiddleLeft }, Pad, y, 112, 30);
+                Add(new Label { Text = "ce PC", ForeColor = Ui.Dim, AutoSize = false, TextAlign = ContentAlignment.MiddleLeft }, Pad + 116, y, 150, 30);
+                y += 34;
+                foreach (int code in offered)
+                {
+                    if (code == s.Input) continue;
+                    int index = i, input = code;
+                    ConsoleInput old = before.Find(c => c.Input == input && Ddc.FindScreen(ids, c.Screen) == index);
+                    AddRow(s, code, old);
+                }
+                y -= 4;
+                EndCard();
+            }
+            foreach (ConsoleInput c in before)
+                if (!shown.Contains(Ddc.FindScreen(ids, c.Screen))) kept.Add(c);
+            y += 8;
+            cancel.Top = S(y);
+            save.Top = S(y);
+            save.Enabled = rows.Count > 0;
+            ClientSize = new Size(S(W), S(y + 34 + 16));
+            ResumeLayout();
+            ShowKeys();
+            Center();
+            Invalidate();
+            if (rows.Count > 0) rows[0].Name.Focus();
+        }
+
+        // Une prise à nommer. Une console déjà réglée garde son nom, et son raccourci s'il a été choisi.
+        void AddRow(ScreenLight s, int code, ConsoleInput old)
+        {
+            bool chosen = old != null && old.Chosen;
+            string input = Inputs.NameOf(code);
+            var row = new Row
+            {
+                Entry = new ConsoleInput { Name = old == null ? string.Empty : old.Name, Screen = s.Id, Input = code, Home = s.Input,
+                    Chosen = chosen, Mods = chosen ? old.Mods : Hotkeys.Cas, Key = chosen ? old.Key : 0 },
+                Where = input + ", " + s.Name
+            };
+            Add(new Label { Text = input, AutoSize = false, TextAlign = ContentAlignment.MiddleLeft }, Pad, y, 112, 30);
+            row.Name = new TextBox { Text = row.Entry.Name, MaxLength = 20, BorderStyle = BorderStyle.FixedSingle, ForeColor = Ui.Text,
+                AccessibleName = "Ce qui est branché sur " + row.Where };
+            Add(row.Name, Pad + 116, y + 3, 150, 24);
+            row.Name.BackColor = Ui.Button;
+            row.Name.TextChanged += delegate { ShowKeys(); };
+            row.Key = new RoundButton(string.Empty) { AccessibleDescription = "Changer le raccourci", Visible = false };
+            tips.SetToolTip(row.Key, row.Key.AccessibleDescription);
+            row.Key.Click += delegate { ChangeKey(row); };
+            Add(row.Key, Pad + 274, y + 1, 180, 28);
+            row.See = new RoundButton(string.Empty) { Text = "Voir", AccessibleName = "Voir " + row.Where,
+                AccessibleDescription = "Passe l'écran sur cette prise " + Seconds + " secondes, puis le ramène sur le PC." };
+            tips.SetToolTip(row.See, row.See.AccessibleDescription);
+            row.See.Click += delegate { See(row); };
+            Add(row.See, W - Pad - 84, y + 1, 84, 28);
+            rows.Add(row);
+            y += 34;
+        }
+
+        void BeginCard()
+        {
+            cardTop = y;
+            y += 12;
+            surface = Ui.Card;
+        }
+
+        void EndCard()
+        {
+            y += 8;
+            cards.Add(new Rectangle(S(Edge), S(cardTop), S(W - 2 * Edge), S(y - cardTop)));
+            y += 12;
+            surface = Ui.Back;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var brush = new SolidBrush(Ui.Card))
+                foreach (Rectangle c in cards)
+                    using (GraphicsPath path = Ui.Round(c, S(8)))
+                        e.Graphics.FillPath(brush, path);
+        }
+
+        // Les raccourcis, à mesure qu'on tape : dans l'ordre des lignes, comme à l'enregistrement. Une prise sans nom n'en a
+        // pas : son bouton est caché.
+        void ShowKeys()
+        {
+            Assign();
+            foreach (Row r in rows)
+            {
+                r.Key.Text = r.Entry.Key == 0 ? "sans raccourci" : r.Entry.Shortcut;
+                r.Key.AccessibleName = "Raccourci de " + r.Where + " : " + r.Key.Text;
+                r.Key.Visible = r.Entry.Name.Length > 0;
+            }
+        }
+
+        // Les noms tapés, puis les raccourcis automatiques (Hotkeys.Assign) ; ceux des consoles gardées sont pris.
+        void Assign()
+        {
+            var taken = new List<uint>(reserved);
+            foreach (ConsoleInput c in kept) if (c.Key != 0 && c.Mods == Hotkeys.Cas) taken.Add(c.Key);
+            foreach (Row r in rows) r.Entry.Name = r.Name.Text.Trim();
+            Hotkeys.Assign(rows.ConvertAll(r => r.Entry), taken);
+        }
+
+        // Un clic sur le raccourci d'une prise : la personne fait sa combinaison. Elle reste, même si le nom change.
+        void ChangeKey(Row r)
+        {
+            uint mods, key;
+            if (capture == null || !capture(this, "Raccourci de " + r.Entry.Name, (m, k) => Refusal(r, m, k), out mods, out key)) return;
+            r.Entry.Mods = mods;
+            r.Entry.Key = key;
+            r.Entry.Chosen = true;
+            ShowKeys();
+        }
+
+        // Pourquoi une combinaison ne peut pas aller à cette prise, ou null : elle sert déjà dans Eclipse, ou à une autre
+        // console.
+        string Refusal(Row r, uint mods, uint key)
+        {
+            string why = refusal == null ? null : refusal(mods, key);
+            if (why != null) return why;
+            Assign();
+            Row other = rows.Find(x => x != r && x.Entry.Key == key && x.Entry.Mods == mods);
+            ConsoleInput away = kept.Find(c => c.Key == key && c.Mods == mods);
+            string name = other != null ? other.Entry.Name : away != null ? away.Name : null;
+            return name == null ? null : Hotkeys.Text(mods, key) + " sert déjà à " + name + ".";
+        }
+
+        void Save()
+        {
+            Back();
+            Assign();
+            var list = new List<ConsoleInput>(kept);
+            foreach (Row r in rows) if (r.Entry.Name.Length > 0) list.Add(r.Entry);
+            Result = list;
+            Close();
+        }
+
+        // « Voir » : l'écran passe sur la prise ; le bouton devient « Revenir » et compte les secondes.
+        void See(Row r)
+        {
+            if (seeing != null) { bool same = seeing == r; Back(); if (same) return; }
+            seeing = r;
+            seeLeft = Seconds;
+            foreach (Row x in rows) x.See.Enabled = x == r;
+            r.See.Text = "Revenir  " + seeLeft;
+            light.SetInput(r.Entry.Screen, r.Entry.Input, null);
+            seeTimer.Start();
+        }
+
+        void SeeTick()
+        {
+            if (seeing == null) { seeTimer.Stop(); return; }
+            if (--seeLeft <= 0) { Back(); return; }
+            seeing.See.Text = "Revenir  " + seeLeft;
+        }
+
+        // Le retour sur le PC après « Voir » (aussi à la fermeture).
+        void Back()
+        {
+            seeTimer.Stop();
+            if (seeing == null) return;
+            light.SetInput(seeing.Entry.Screen, seeing.Entry.Home, null);
+            seeing.See.Text = "Voir";
+            seeing = null;
+            foreach (Row x in rows) x.See.Enabled = true;
+        }
+
+        void OnKey(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Escape) { e.Handled = true; Close(); }
+            else if (e.KeyCode == Keys.Enter && ActiveControl is TextBox && save.Enabled) { e.Handled = e.SuppressKeyPress = true; Save(); }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) { seeTimer.Dispose(); tips.Dispose(); }
+            base.Dispose(disposing);
         }
     }
 
@@ -2003,7 +3745,8 @@ namespace Eclipse
     {
         enum State { Idle, Countdown, Blackout, LockedSession }
 
-        const int HotkeyId = 1, LightUpId = 2, LightDownId = 3;
+        const int HotkeyId = 1, LightUpId = 2, LightDownId = 3, FilterId = 4, ConsoleId = 100; // ConsoleId + n : la console n
+        const string GameValue = "ConsoleEcran", SwappedValue = "ConsolePrincipal"; // l'état du jeu, pour un arrêt brutal
         const int LightStep = 10;
         const string RegKey = @"Software\Eclipse";
         const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -2013,7 +3756,7 @@ namespace Eclipse
         static readonly TimeSpan RelapseWatch = TimeSpan.FromSeconds(15); // écrans rééteints juste après le rallumage
 
         readonly NotifyIcon tray = new NotifyIcon();
-        readonly ToolStripMenuItem offItem, screensItem;
+        readonly ToolStripMenuItem offItem, screensItem, filterItem, consolesItem;
         readonly OverlayHost overlay = new OverlayHost();
         readonly Worker sound = new Worker();
         readonly Watchdog watchdog = new Watchdog();
@@ -2036,6 +3779,17 @@ namespace Eclipse
         int savedScreenSaver = -1;
         DateTime lastOffSent, releasedAt, wokeAt;
         bool keepAwakeUntilWake;
+        // Les consoles. playing : celle à l'écran, ou null ; swapped : l'écran des consoles, s'il était l'écran principal
+        // avant le jeu, à remettre ensuite. Les deux sont aussi dans le registre (GameValue, SwappedValue).
+        List<ConsoleInput> consoles = ConsoleInput.Load();
+        int consoleKeys;       // les raccourcis posés : ConsoleId à ConsoleId + consoleKeys - 1
+        ConsoleInput playing;
+        string swapped;
+        bool switching, polling; // un changement d'entrée en cours ; une lecture de l'entrée en cours
+        readonly Timer consolePoll = new Timer { Interval = 3000 };
+        readonly Queue<Action> uiJobs = new Queue<Action>();
+        ConsoleDialog consoleDialog;
+        bool capturing;        // une fenêtre de capture est ouverte : les raccourcis d'Eclipse sont rendus à Windows
 
         public App(bool afterRescue)
         {
@@ -2052,6 +3806,19 @@ namespace Eclipse
             offItem.Font = new Font(offItem.Font, FontStyle.Bold);
             menu.Items.Add(offItem);
             menu.Items.Add("Luminosité des écrans...", null, delegate { OpenPanel(); });
+            filterItem = new ToolStripMenuItem("Lumière bleue");
+            filterItem.DropDownItems.Add(new ToolStripMenuItem("Pas de filtre", null, delegate { SetFilter(BlueFilter.Non); }));
+            filterItem.DropDownItems.Add(new ToolStripMenuItem("Filtrée sous le minimum", null, delegate { SetFilter(BlueFilter.SousLeMin); }));
+            filterItem.DropDownItems.Add(new ToolStripMenuItem("Toujours filtrée", null, delegate { SetFilter(BlueFilter.Toujours); })
+                { ShortcutKeyDisplayString = "Ctrl+Alt+Maj+B" });
+            filterItem.DropDownOpening += delegate
+            {
+                for (int i = 0; i < filterItem.DropDownItems.Count; i++)
+                    ((ToolStripMenuItem)filterItem.DropDownItems[i]).Checked = i == (int)dimmer.Mode;
+            };
+            menu.Items.Add(filterItem);
+            consolesItem = new ToolStripMenuItem("Consoles");
+            menu.Items.Add(consolesItem);
             menu.Items.Add("Éteindre et verrouiller Windows", null, delegate { BeginLocked(); });
             menu.Items.Add(new ToolStripSeparator());
             screensItem = new ToolStripMenuItem(string.Empty) { Enabled = false };
@@ -2063,7 +3830,8 @@ namespace Eclipse
             menu.Items.Add("Sorties de secours", null, delegate { ShowHelp(); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Quitter", null, delegate { Application.Exit(); });
-            menu.Opening += delegate { RefreshLabels(); };
+            menu.Opening += delegate { RefreshLabels(); FillConsolesMenu(); };
+            FillConsolesMenu(); // la flèche du sous-menu dès le premier clic droit
 
             tray.Icon = MakeIcon();
             tray.ContextMenuStrip = menu;
@@ -2089,10 +3857,10 @@ namespace Eclipse
             RestoreSoundWithRetries(); // un muet resté d'un arrêt brutal
             if (StartupEnabled()) SetStartup(true); // le chemin suit le programme s'il a été déplacé
             RefreshLabels();
-            if (!Native.RegisterHotKey(Handle, LightUpId, Native.MOD_CONTROL | Native.MOD_ALT | Native.MOD_SHIFT, Native.VK_UP)
-                | !Native.RegisterHotKey(Handle, LightDownId, Native.MOD_CONTROL | Native.MOD_ALT | Native.MOD_SHIFT, Native.VK_DOWN))
-                Journal.Write("Luminosité : Ctrl+Alt+Maj+Haut ou Bas est déjà pris par une autre appli.");
-            if (!RegisterCurrentHotkey())
+            bool mainKey = RegisterKeys(true);
+            consolePoll.Tick += delegate { PollConsole(); };
+            Try("les consoles", ResumeGame);
+            if (!mainKey)
                 tray.ShowBalloonTip(5000, "Eclipse", "Le raccourci " + ShortcutText() + " est déjà pris par une autre appli. Changez-le depuis le menu.", ToolTipIcon.Warning);
             else if (afterRescue)
                 tray.ShowBalloonTip(5000, "Eclipse", "Eclipse s'est relancé après une sortie de secours. Le son revient.", ToolTipIcon.Info);
@@ -2111,7 +3879,7 @@ namespace Eclipse
             if (state != State.Idle) return;
             if (panel != null && !panel.IsDisposed) { panel.Activate(); return; }
             if (DateTime.UtcNow - panelClosedAt < TimeSpan.FromMilliseconds(400)) return; // ce clic vient de le fermer
-            panel = new BrightnessPanel(light, dimmer, "Éteindre les écrans (" + ShortcutText() + ")", Begin);
+            panel = new BrightnessPanel(light, dimmer, "Éteindre les écrans (" + ShortcutText() + ")", Begin, consoles, playing, PickConsole);
             panel.FormClosed += delegate { panel = null; panelClosedAt = DateTime.UtcNow; };
             panel.Show();
             panel.Activate();
@@ -2139,9 +3907,365 @@ namespace Eclipse
             osd.Flash(value);
         }
 
+        // ---- La lumière bleue ----
+
+        // Ctrl+Alt+Maj+B : « Toujours filtrée », ou le choix habituel, avec le rappel en bas de l'écran.
+        void ToggleFilter()
+        {
+            dimmer.Toggle();
+            if (panel != null && !panel.IsDisposed) panel.ShowFilter();
+            if (osd == null || osd.IsDisposed) osd = new LightOsd();
+            osd.FlashFilter(dimmer.Mode, dimmer.Chaleur);
+        }
+
+        void SetFilter(BlueFilter mode)
+        {
+            dimmer.SetMode(mode);
+            if (panel != null && !panel.IsDisposed) panel.ShowFilter();
+        }
+
         void OnDisplayChanged(object sender, EventArgs e)
         {
             light.Refresh(null); // un écran branché, débranché ou déplacé : on relit tout
+            // L'écran des consoles revenu après le jeu (il était débranché) : il redevient l'écran principal.
+            if (playing == null && !switching && swapped != null) Try("l'écran principal", RestorePrimary);
+        }
+
+        // ---- Les consoles ----
+
+        // Les travaux rendus par le fil des écrans, faits ici, au fil principal (WM_APP_RUN).
+        void OnUi(Action job)
+        {
+            lock (uiJobs) uiJobs.Enqueue(job);
+            Native.PostMessage(Handle, Native.WM_APP_RUN, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        void RunUiJobs()
+        {
+            for (;;)
+            {
+                Action job;
+                lock (uiJobs)
+                {
+                    if (uiJobs.Count == 0) return;
+                    job = uiJobs.Dequeue();
+                }
+                Try("les consoles", job);
+            }
+        }
+
+        // Les raccourcis d'Eclipse, le principal d'abord : éteindre passe avant les autres (la 1.0 acceptait par exemple
+        // Ctrl+Alt+Maj+B). tell : dire ceux qu'une autre appli a déjà pris (au démarrage).
+        bool RegisterKeys(bool tell)
+        {
+            bool mainKey = RegisterCurrentHotkey();
+            if ((!Native.RegisterHotKey(Handle, LightUpId, Hotkeys.Cas, Native.VK_UP)
+                | !Native.RegisterHotKey(Handle, LightDownId, Hotkeys.Cas, Native.VK_DOWN)) && tell)
+                Journal.Write("Luminosité : Ctrl+Alt+Maj+Haut ou Bas est déjà pris.");
+            if (!Native.RegisterHotKey(Handle, FilterId, Hotkeys.Cas | Native.MOD_NOREPEAT, (uint)Keys.B) && tell)
+                Journal.Write("Lumière bleue : Ctrl+Alt+Maj+B est déjà pris.");
+            RegisterConsoleKeys(tell);
+            return mainKey;
+        }
+
+        // Un raccourci déjà pris ailleurs n'est plus annoncé (menu, message, panneau) ; tell : une bulle le dit.
+        void RegisterConsoleKeys(bool tell)
+        {
+            for (int i = 0; i < consoleKeys; i++) Native.UnregisterHotKey(Handle, ConsoleId + i);
+            consoleKeys = consoles.Count;
+            var refused = new List<string>();
+            for (int i = 0; i < consoles.Count; i++)
+            {
+                ConsoleInput c = consoles[i];
+                c.Refused = c.Key != 0 && !Native.RegisterHotKey(Handle, ConsoleId + i, c.Mods | Native.MOD_NOREPEAT, c.Key);
+                if (c.Refused) refused.Add(c.Shortcut);
+            }
+            if (refused.Count == 0 || !tell) return;
+            string keys = string.Join(", ", refused);
+            Journal.Write("Consoles : " + keys + " déjà pris par une autre appli.");
+            tray.ShowBalloonTip(5000, "Eclipse", keys + (refused.Count > 1 ? " sont déjà pris" : " est déjà pris")
+                + " par une autre appli. Pour en choisir un autre : menu de l'icône, Consoles, Régler les consoles.", ToolTipIcon.Warning);
+        }
+
+        // Une combinaison demandée à la personne. Pendant ce temps, les raccourcis d'Eclipse sont rendus à Windows : la
+        // fenêtre reçoit la combinaison, au lieu qu'une console bascule ou que la lumière bleue change. Une seule à la fois.
+        bool Capture(IWin32Window owner, string title, Func<uint, uint, string> refusal, out uint mods, out uint key)
+        {
+            mods = key = 0;
+            if (capturing) return false;
+            capturing = true;
+            foreach (int id in new[] { HotkeyId, LightUpId, LightDownId, FilterId }) Native.UnregisterHotKey(Handle, id);
+            for (int i = 0; i < consoleKeys; i++) Native.UnregisterHotKey(Handle, ConsoleId + i);
+            try
+            {
+                using (var dialog = new HotkeyDialog(title, refusal))
+                {
+                    if (owner != null) dialog.StartPosition = FormStartPosition.CenterParent;
+                    if (dialog.ShowDialog(owner) != DialogResult.OK) return false;
+                    mods = dialog.Mods;
+                    key = dialog.Key;
+                    return true;
+                }
+            }
+            finally
+            {
+                capturing = false;
+                RegisterKeys(false);
+            }
+        }
+
+        // Pourquoi une combinaison ne peut pas aller à une console, ou null.
+        string ConsoleRefusal(uint mods, uint key) { return Hotkeys.ForConsole(mods, key, hotMods, hotKey, Native.GetKeyboardLayout(0)); }
+
+        // Pourquoi une combinaison ne peut pas devenir le raccourci principal, ou null.
+        string MainRefusal(uint mods, uint key) { return Hotkeys.ForMain(mods, key, consoles, Native.GetKeyboardLayout(0)); }
+
+        void FillConsolesMenu()
+        {
+            var old = new List<ToolStripItem>();
+            foreach (ToolStripItem item in consolesItem.DropDownItems) old.Add(item);
+            consolesItem.DropDownItems.Clear();
+            foreach (ToolStripItem item in old) item.Dispose();
+            foreach (ConsoleInput c in consoles)
+            {
+                ConsoleInput target = c;
+                consolesItem.DropDownItems.Add(new ToolStripMenuItem(c.Name.Replace("&", "&&"), null, delegate { ToggleConsole(target); })
+                    { Checked = c == playing, ShortcutKeyDisplayString = c.WorkingShortcut });
+            }
+            if (playing != null)
+                consolesItem.DropDownItems.Add(new ToolStripMenuItem("Revenir sur le PC", null, delegate { if (playing != null) ToggleConsole(playing); })
+                    { ShortcutKeyDisplayString = playing.WorkingShortcut });
+            if (consoles.Count > 0) consolesItem.DropDownItems.Add(new ToolStripSeparator());
+            consolesItem.DropDownItems.Add(new ToolStripMenuItem(playing == null ? "Régler les consoles..." : "Régler les consoles (depuis le PC)",
+                null, delegate { SetUpConsoles(); }) { Enabled = playing == null });
+        }
+
+        static bool SameScreen(string a, string b) { return string.Equals(a, b, StringComparison.OrdinalIgnoreCase); }
+
+        // Le raccourci d'une console : l'écran passe dessus ; le même raccourci le ramène sur le PC. Celui d'une autre console
+        // du même écran passe de l'une à l'autre.
+        void ToggleConsole(ConsoleInput c)
+        {
+            if (state != State.Idle || switching) return;
+            if (playing == null) GoConsole(c);
+            else if (playing == c) GoHome(null);
+            else if (SameScreen(playing.Screen, c.Screen)) GoConsole(c);
+            else GoHome(delegate { GoConsole(c); }); // une console d'un autre écran : le premier revient d'abord sur le PC
+        }
+
+        // Depuis le panneau ; c vaut null pour « PC ».
+        void PickConsole(string screen, ConsoleInput c)
+        {
+            if (c != null) { if (c != playing) ToggleConsole(c); }
+            else if (playing != null && SameScreen(playing.Screen, screen)) ToggleConsole(playing);
+        }
+
+        // Vers la console. Si son écran est l'écran principal, son voisin le devient d'abord, pendant que l'écran montre
+        // encore le PC ; puis l'écran change d'entrée. Un message dit, sur l'écran du PC, comment revenir.
+        void GoConsole(ConsoleInput c)
+        {
+            string device = PrimaryScreen.DeviceOf(c.Screen);
+            if (device == null) { Notice(c.Name + " : son écran n'est pas branché", null); return; }
+            if (playing == null && swapped == null && PrimaryScreen.IsPrimary(device))
+            {
+                string neighbour = PrimaryScreen.Neighbour(device);
+                if (neighbour != null && PrimaryScreen.Set(neighbour))
+                {
+                    swapped = c.Screen;
+                    SaveGameValue(SwappedValue, swapped);
+                }
+            }
+            switching = true;
+            light.SetInput(c.Screen, c.Input, ok => OnUi(delegate
+            {
+                switching = false;
+                if (!ok)
+                {
+                    if (playing == null) RestorePrimary();
+                    Notice(c.Name + " : l'écran ne répond pas", device);
+                    return;
+                }
+                playing = c;
+                SaveGameValue(GameValue, c.Screen);
+                consolePoll.Start();
+                Journal.Write("Consoles : écran passé sur " + c.Name + " (" + Inputs.NameOf(c.Input) + ").");
+                Notice(c.Name + "  ·  retour au PC : " + (c.WorkingShortcut ?? "menu de l'icône, Consoles"), device);
+            }));
+        }
+
+        // Vers le PC : l'écran reprend l'entrée du PC, puis redevient l'écran principal s'il l'était. then : la suite, si
+        // le retour a marché.
+        void GoHome(Action then)
+        {
+            ConsoleInput c = playing;
+            if (c == null) return;
+            string device = PrimaryScreen.DeviceOf(c.Screen);
+            if (device == null)
+            {
+                EndGame("l'écran n'est plus vu par Windows");
+                Notice("L'écran de " + c.Name + " n'est plus vu par Windows : utilisez son bouton des entrées", null);
+                return;
+            }
+            switching = true;
+            light.SetInput(c.Screen, c.Home, ok => OnUi(delegate
+            {
+                switching = false;
+                if (playing != c) return;
+                if (!ok) { Notice("L'écran ne répond pas : réessayez, ou utilisez son bouton des entrées", device); return; }
+                EndGame("retour au PC");
+                if (then != null) then();
+            }));
+        }
+
+        // La fin du jeu, l'écran déjà revenu sur le PC (ou plus vu par Windows).
+        void EndGame(string why)
+        {
+            playing = null;
+            consolePoll.Stop();
+            SaveGameValue(GameValue, null);
+            RestorePrimary();
+            Journal.Write("Consoles : fin du jeu (" + why + ").");
+        }
+
+        // L'écran des consoles redevient l'écran principal s'il l'était avant le jeu ; débranché, il le redevient à son
+        // retour (OnDisplayChanged) ou au prochain démarrage.
+        void RestorePrimary()
+        {
+            if (swapped == null) return;
+            string device = PrimaryScreen.DeviceOf(swapped);
+            if (device == null || !PrimaryScreen.Set(device)) return;
+            swapped = null;
+            SaveGameValue(SwappedValue, null);
+        }
+
+        // Pendant le jeu, toutes les 3 s : l'entrée de l'écran (règle de ConsoleInput.Read). Revenu seul sur le PC (sans
+        // image, l'écran cherche une autre entrée) ou par son bouton : le jeu s'arrête. Passé sur une autre console réglée :
+        // elle devient celle à l'écran. Pas de réponse : on attend la lecture suivante.
+        void PollConsole()
+        {
+            ConsoleInput c = playing;
+            if (c == null) { consolePoll.Stop(); return; }
+            if (polling || switching || state != State.Idle) return;
+            polling = true;
+            light.GetInput(c.Screen, code => OnUi(delegate
+            {
+                polling = false;
+                if (playing != c || switching) return;
+                ConsoleInput shown;
+                Seen seen = ConsoleInput.Read(code, c.Screen, consoles, out shown);
+                if (seen == Seen.Pc) EndGame("l'écran est revenu sur le PC");
+                else if (seen == Seen.Console && shown != c)
+                {
+                    playing = shown;
+                    Journal.Write("Consoles : l'écran est passé sur " + shown.Name + ".");
+                }
+            }));
+        }
+
+        // Au démarrage, après un arrêt d'Eclipse pendant le jeu (arrêt brutal, mise à jour, arrêt de Windows), la même règle
+        // que la lecture des 3 s : l'écran montre le PC, tout revient ; il montre une console, ou ne répond pas encore, le
+        // jeu continue et la lecture des 3 s tranchera.
+        void ResumeGame()
+        {
+            swapped = LoadGameValue(SwappedValue);
+            string screen = LoadGameValue(GameValue);
+            if (screen == null) { RestorePrimary(); return; }
+            light.GetInput(screen, code => OnUi(delegate
+            {
+                if (playing != null || switching) return;
+                ConsoleInput c;
+                if (ConsoleInput.Read(code, screen, consoles, out c) == Seen.Pc) { EndGame("Eclipse arrêté pendant le jeu"); return; }
+                if (c == null) c = consoles.Find(x => SameScreen(x.Screen, screen)); // en attendant que l'écran réponde
+                playing = c;
+                consolePoll.Start();
+                Journal.Write("Consoles : le jeu continue sur " + c.Name + (code < 0 ? " (l'écran ne répond pas encore)." : "."));
+            }));
+        }
+
+        // Eclipse s'arrête pendant le jeu. Quitter ramène l'écran sur le PC : sans Eclipse, plus de raccourci pour revenir.
+        // L'arrêt de Windows le laisse sur la console. Le jeu ne se termine (l'écran principal rendu) que si l'écran est
+        // bien revenu sur le PC, ou à l'arrêt de Windows quand Eclipse ne redémarre pas avec lui. Sinon le registre garde le
+        // jeu et le prochain démarrage décide (ResumeGame) : l'écran principal reste celui qu'on voit, même pour se connecter.
+        void LeaveGame(bool backToPc)
+        {
+            ConsoleInput c = playing;
+            if (c == null) { RestorePrimary(); return; }
+            if (backToPc)
+            {
+                bool ok = false, back;
+                using (var done = new ManualResetEvent(false))
+                {
+                    light.SetInput(c.Screen, c.Home, result => { ok = result; try { done.Set(); } catch (ObjectDisposedException) { } });
+                    back = done.WaitOne(6000) && ok;
+                }
+                if (back) EndGame("Quitter");
+                else SuspendGame("Quitter, l'écran ne revient pas sur le PC");
+            }
+            else if (StartupEnabled()) SuspendGame("arrêt de Windows pendant le jeu");
+            else EndGame("arrêt de Windows");
+        }
+
+        // Le jeu laissé au prochain démarrage : oublié ici, gardé dans le registre (ResumeGame le reprend).
+        void SuspendGame(string why)
+        {
+            playing = null;
+            swapped = null; // ni Quitter ni un changement d'affichage ne doivent plus le rendre ici
+            consolePoll.Stop();
+            Journal.Write("Consoles : " + why + " ; le prochain démarrage reprendra le jeu.");
+        }
+
+        void Notice(string text, string notOn)
+        {
+            if (osd == null || osd.IsDisposed) osd = new LightOsd();
+            osd.FlashMessage(text, notOn);
+        }
+
+        // Le questionnaire, seulement depuis le PC : l'entrée que chaque écran affiche à l'ouverture est celle du PC.
+        void SetUpConsoles()
+        {
+            if (state != State.Idle || playing != null || switching || capturing) return;
+            if (consoleDialog != null && !consoleDialog.IsDisposed) { consoleDialog.Activate(); return; }
+            var dialog = new ConsoleDialog(light, consoles, ConsoleRefusal, Capture);
+            consoleDialog = dialog;
+            dialog.FormClosed += delegate
+            {
+                consoleDialog = null;
+                if (dialog.Result == null) return;
+                consoles = dialog.Result;
+                ConsoleInput.Save(consoles);
+                RegisterConsoleKeys(true);
+                if (playing != null) // une console prise au clavier pendant le questionnaire
+                    playing = consoles.Find(x => SameScreen(x.Screen, playing.Screen) && x.Input == playing.Input) ?? playing;
+                Journal.Write("Consoles : " + consoles.Count + " réglée(s).");
+            };
+            dialog.Show();
+            dialog.Activate();
+        }
+
+        static string LoadGameValue(string name)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegKey))
+                {
+                    string v = key == null ? null : key.GetValue(name) as string;
+                    return string.IsNullOrEmpty(v) ? null : v;
+                }
+            }
+            catch { return null; }
+        }
+
+        static void SaveGameValue(string name, string value)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegKey))
+                {
+                    if (value == null) key.DeleteValue(name, false);
+                    else key.SetValue(name, value);
+                }
+            }
+            catch (Exception e) { Journal.Write("Consoles : état du jeu non enregistré (" + e.Message + ")."); }
         }
 
         void Begin()
@@ -2353,6 +4477,17 @@ namespace Eclipse
                         if (state == State.Idle) StepLight(m.WParam.ToInt32() == LightUpId ? LightStep : -LightStep);
                         return;
                     }
+                    if (m.WParam.ToInt32() == FilterId)
+                    {
+                        if (state == State.Idle) ToggleFilter();
+                        return;
+                    }
+                    int console = m.WParam.ToInt32() - ConsoleId;
+                    if (console >= 0 && console < consoleKeys)
+                    {
+                        if (state == State.Idle && console < consoles.Count) ToggleConsole(consoles[console]);
+                        return;
+                    }
                     if (m.WParam.ToInt32() != HotkeyId) break;
                     if (state == State.Idle) { if (DateTime.UtcNow - releasedAt >= SamePress) Begin(); }
                     else if (state == State.Countdown && countdown != null) countdown.Cancel();
@@ -2360,6 +4495,9 @@ namespace Eclipse
                     return;
                 case Native.WM_APP_RELEASE:
                     FinishRelease();
+                    return;
+                case Native.WM_APP_RUN:
+                    RunUiJobs();
                     return;
                 case Native.WM_APP_LIGHT:
                     if (state != State.Idle) return;
@@ -2393,21 +4531,17 @@ namespace Eclipse
                     }
                     break;
                 case Native.WM_ENDSESSION:
-                    if (m.WParam != IntPtr.Zero) sound.RunAndWait(delegate { Sound.Restore(); }, 3000);
+                    if (m.WParam != IntPtr.Zero)
+                    {
+                        sound.RunAndWait(delegate { Sound.Restore(); }, 3000);
+                        Try("les consoles", delegate { LeaveGame(false); });
+                    }
                     break;
             }
             base.WndProc(ref m);
         }
 
-        string ShortcutText()
-        {
-            var sb = new StringBuilder();
-            if ((hotMods & Native.MOD_CONTROL) != 0) sb.Append("Ctrl+");
-            if ((hotMods & Native.MOD_ALT) != 0) sb.Append("Alt+");
-            if ((hotMods & Native.MOD_SHIFT) != 0) sb.Append("Maj+");
-            sb.Append(((Keys)hotKey).ToString());
-            return sb.ToString();
-        }
+        string ShortcutText() { return Hotkeys.Text(hotMods, hotKey); }
 
         bool RegisterCurrentHotkey()
         {
@@ -2422,7 +4556,7 @@ namespace Eclipse
                 {
                     if (key == null) return;
                     object mods = key.GetValue("Mods"), vk = key.GetValue("Key");
-                    if (mods is int && vk is int) { hotMods = (uint)(int)mods; hotKey = (uint)(int)vk; }
+                    if (mods is int && vk is int) { hotMods = Hotkeys.ModsFrom(mods); hotKey = (uint)(int)vk; }
                 }
             }
             catch { }
@@ -2430,11 +4564,15 @@ namespace Eclipse
 
         void ChangeHotkey()
         {
-            if (state != State.Idle) return;
-            Native.UnregisterHotKey(Handle, HotkeyId);
+            // Le questionnaire ouvert règle des raccourcis pas encore enregistrés : on le finit d'abord.
+            if (consoleDialog != null && !consoleDialog.IsDisposed) { consoleDialog.Activate(); return; }
+            uint mods, key;
+            if (state != State.Idle || !Capture(null, "Changer le raccourci", MainRefusal, out mods, out key)) return;
+            if (mods == hotMods && key == hotKey) return;
             uint oldMods = hotMods, oldKey = hotKey;
-            using (var dialog = new HotkeyDialog())
-                if (dialog.ShowDialog() == DialogResult.OK) { hotMods = dialog.Mods; hotKey = dialog.Key; }
+            Native.UnregisterHotKey(Handle, HotkeyId);
+            hotMods = mods;
+            hotKey = key;
             if (!RegisterCurrentHotkey())
             {
                 MessageBox.Show(ShortcutText() + " est déjà pris par une autre appli. On garde l'ancien.", "Eclipse");
@@ -2442,12 +4580,12 @@ namespace Eclipse
                 hotKey = oldKey;
                 RegisterCurrentHotkey();
             }
-            else if (hotMods != oldMods || hotKey != oldKey)
+            else
             {
-                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegKey))
+                using (RegistryKey k = Registry.CurrentUser.CreateSubKey(RegKey))
                 {
-                    key.SetValue("Mods", (int)hotMods);
-                    key.SetValue("Key", (int)hotKey);
+                    k.SetValue("Mods", (int)hotMods);
+                    k.SetValue("Key", (int)hotKey);
                 }
             }
             RefreshLabels();
@@ -2470,7 +4608,9 @@ namespace Eclipse
                 + "\n\nAutre sortie : Ctrl+Alt+Suppr, puis Annuler."
                 + "\n\nAu bout de 12 heures, le clavier, la souris et le son reviennent seuls. Les écrans restent éteints jusqu'à ce que vous touchiez quelque chose."
                 + "\n\nEn dernier recours, le bouton d'alimentation du PC marche toujours."
-                + "\n\nLuminosité des écrans : un clic sur l'icône, ou Ctrl+Alt+Maj+Haut / Bas (10 % à la fois). Sous le seuil « min », l'image est assombrie au-delà du minimum de l'écran. Un double-clic sur l'icône éteint.",
+                + "\n\nLuminosité des écrans : un clic sur l'icône, ou Ctrl+Alt+Maj+Haut / Bas (10 % à la fois). Sous le seuil « min », l'image est assombrie au-delà du minimum de l'écran. Un double-clic sur l'icône éteint."
+                + "\n\nLumière bleue : Ctrl+Alt+Maj+B la filtre tout le temps, ou plus. Dans le panneau, choisissez aussi de la filtrer seulement sous le minimum, et sa chaleur."
+                + "\n\nConsoles : nommez les prises de vos écrans (menu de l'icône, Consoles). Chaque nom reçoit un raccourci, Ctrl+Alt+Maj et une lettre, qui passe l'écran sur la console ; le même raccourci le ramène sur le PC. Pour en choisir un autre, cliquez dessus dans le questionnaire.",
                 "Eclipse : sorties de secours");
         }
 
@@ -2538,6 +4678,9 @@ namespace Eclipse
             InputBlocker b = blocker ?? Rallumage.Blocker;
             if (b != null) b.Stop();
             sound.RunAndWait(delegate { Sound.Restore(); }, 3000);
+            if (consoleDialog != null && !consoleDialog.IsDisposed) consoleDialog.Close(); // après « Voir » : l'écran revient
+            Try("les consoles", delegate { LeaveGame(true); });
+            consolePoll.Dispose();
             Journal.Write("Quitté.");
             SystemEvents.SessionSwitch -= OnSessionSwitch;
             SystemEvents.UserPreferenceChanged -= OnThemeChanged;
@@ -2545,6 +4688,8 @@ namespace Eclipse
             Native.UnregisterHotKey(Handle, HotkeyId);
             Native.UnregisterHotKey(Handle, LightUpId);
             Native.UnregisterHotKey(Handle, LightDownId);
+            Native.UnregisterHotKey(Handle, FilterId);
+            for (int i = 0; i < consoleKeys; i++) Native.UnregisterHotKey(Handle, ConsoleId + i);
             singleClick.Dispose();
             if (panel != null && !panel.IsDisposed) panel.Dispose();
             if (osd != null && !osd.IsDisposed) osd.Dispose();
